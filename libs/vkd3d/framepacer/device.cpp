@@ -64,14 +64,27 @@ namespace pacer {
                 m_vulkanQueues.push_back( vulkanQueue );
             }
 
-            CommandQueue::Properties properties;
-            properties.id = m_commandQueues.size(); id = properties.id;
-            properties.type = type;
-            properties.vkd3d_command_queue = vkd3d_command_queue;
-            properties.vkd3d_queue = vkd3d_queue;
-            CommandQueue* commandQueue = new CommandQueue( this, properties, (VulkanQueue*) queues.vulkan_queue );
-            queues.command_queue = (pacer_command_queue_handle) commandQueue;
-            m_commandQueues.push_back( commandQueue );
+            queues.command_queue = nullptr;
+            for (CommandQueue* commandQueue : m_commandQueues) {
+                if (commandQueue->m_properties.vkd3d_command_queue == vkd3d_command_queue
+                    && commandQueue->m_properties.vkd3d_queue == vkd3d_queue
+                    && commandQueue->m_properties.type == type) {
+                    queues.command_queue = (pacer_command_queue_handle) commandQueue;
+                    id = commandQueue->m_properties.id;
+                    break;
+                }
+            }
+
+            if (queues.command_queue == nullptr) {
+                CommandQueue::Properties properties;
+                properties.id = m_commandQueues.size(); id = properties.id;
+                properties.type = type;
+                properties.vkd3d_command_queue = vkd3d_command_queue;
+                properties.vkd3d_queue = vkd3d_queue;
+                CommandQueue* commandQueue = new CommandQueue( this, properties, (VulkanQueue*) queues.vulkan_queue );
+                queues.command_queue = (pacer_command_queue_handle) commandQueue;
+                m_commandQueues.push_back( commandQueue );
+            }
         }
 
         INFO( "command_queue %u (%" PRIu64 ") registered to pacer [%" PRIu64
@@ -147,7 +160,8 @@ namespace pacer {
 
     void Device::assignPrimaryCommandQueue( void* vkd3d_command_queue ) {
         {   std::lock_guard<dxvk::mutex> lock(m_queueMutex);
-            for (CommandQueue* commandQueue : m_commandQueues) {
+            for (auto it = m_commandQueues.rbegin(); it != m_commandQueues.rend(); ++it) {
+                CommandQueue* commandQueue = *it;
                 if (commandQueue->m_properties.vkd3d_command_queue == vkd3d_command_queue) {
                     m_primaryCommandQueue = commandQueue;
                     return;
