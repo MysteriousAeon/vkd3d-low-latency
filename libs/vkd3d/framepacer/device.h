@@ -18,6 +18,7 @@ namespace pacer {
         void* vkd3d_command_queue;
         DXGI_SWAP_CHAIN_DESC1 desc;
         vkd3d_native_sync_handle* latency_event;
+        uint64_t telemetryId;
     };
 
     class Device {
@@ -33,6 +34,7 @@ namespace pacer {
         void registerSwapchain( void* vkd3d_swapchain, void* vkd3d_command_queue, DXGI_SWAP_CHAIN_DESC1 desc, vkd3d_native_sync_handle* latency_event );
         void unregisterSwapchain( void* vkd3d_swapchain );
         vkd3d_native_sync_handle* getLatencyEvent( void* vkd3d_swapchain );
+        uint64_t getSwapchainTelemetryId(void* vkd3d_swapchain);
 
         void getCommandQueues( std::vector<CommandQueue*>& outQueues );
         void getVulkanQueues( std::vector<VulkanQueue*>& outQueues );
@@ -40,6 +42,7 @@ namespace pacer {
         pacer_device_properties m_properties;
         pacer_device_vk_procs   m_vkProcs;
         CalibratedDeviceTimestamps m_calibratedDeviceTimestamps;
+        uint64_t m_telemetryId = 0;
 
         // todo: make those two atomic together
         std::atomic< void* > m_activeSwapchain = { nullptr };

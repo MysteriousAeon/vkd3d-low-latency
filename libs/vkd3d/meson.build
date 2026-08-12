@@ -93,6 +93,7 @@ vkd3d_src = [
   'framepacer/framepacer_bridge.cpp',
   'framepacer/framepacer.cpp',
   'framepacer/simulation_ledger.cpp',
+  'framepacer/telemetry.cpp',
   'framepacer/device.cpp',
   'framepacer/calibrated_device_timestamps.cpp',
   'framepacer/util/util_sleep.cpp',

@@ -76,6 +76,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_queue_vkd3d_ext_NotifyOutOfBandCo
             struct vkd3d_queue *out_of_band_queue = command_queue->device->queue_families[i]->out_of_band_queue;
             vkd3d_set_queue_out_of_band(command_queue->device, out_of_band_queue, vk_queue_type);
             command_queue->vkd3d_queue = out_of_band_queue;
+            /* Observation only: retain the role already supplied by the app.
+             * This does not participate in queue selection or pacer policy. */
+            if (pacer_telemetry_enabled())
+                pacer_command_queue_set_observed_oob_role(
+                        command_queue->pacer_queues.command_queue, type);
             break;
         }
     }
@@ -93,4 +98,3 @@ CONST_VTBL struct ID3D12CommandQueueExtVtbl d3d12_command_queue_vkd3d_ext_vtbl =
     /* ID3D12CommandQueueExt methods */
     d3d12_command_queue_vkd3d_ext_NotifyOutOfBandCommandQueue
 };
-

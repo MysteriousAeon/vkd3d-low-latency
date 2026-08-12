@@ -10,6 +10,7 @@
 #include "simulation_ledger.h"
 #include "latency_stats.h"
 #include "jitter_stats.h"
+#include "telemetry.h"
 #include "util/sync/sync_ringbuffer_allocator.h"
 #include "util/util_log.h"
 #include <unordered_map>
@@ -72,8 +73,33 @@ namespace pacer {
                 PRIu64 " m_frameSync.gpuFinished: %" PRIu64 " \n",
                 frameId, m_frameSync.cpuFinished.load(), m_frameSync.gpuFinished.load() );
 
+            const bool telemetryEnabled = telemetry::isEnabled();
+            uint64_t telemetryEntry = 0;
+            uint64_t cpuFinishedAtEntry = 0;
+            uint64_t gpuFinishedAtEntry = 0;
+            if (telemetryEnabled) {
+                telemetryEntry = telemetry::nowNs();
+                cpuFinishedAtEntry = m_frameSync.cpuFinished.load();
+                gpuFinishedAtEntry = m_frameSync.gpuFinished.load();
+            }
             if (isReflexAccountingState(accountingState)
                     && m_simulationLedger.shouldBypassPacing()) {
+                if (telemetryEnabled) {
+                telemetry::Event event;
+                event.type = telemetry::Type::Pacing;
+                event.deviceId = m_device->m_telemetryId;
+                event.phase = telemetry::Phase::Wait;
+                event.epochId = accountingState;
+                event.simulationId = frameId;
+                event.timestamp0 = telemetryEntry;
+                event.id0 = frameId - m_frameSync.m_waitLatency;
+                event.id1 = gpuFinishedAtEntry;
+                event.id2 = cpuFinishedAtEntry;
+                event.count0 = m_frameSync.m_waitLatency;
+                event.value0 = int64_t(frameId) - int64_t(gpuFinishedAtEntry);
+                event.flags = 1;
+                telemetry::emit(event);
+                }
 #ifdef VKD3D_ENABLE_TEST_HOOKS
                 m_testSleepDecision.exit_accounting_state = getAccountingState();
 #endif
@@ -83,6 +109,7 @@ namespace pacer {
 
             // wait for finished rendering of a previous frame, typically the one before last
             uint64_t waitId = frameId-m_frameSync.m_waitLatency;
+            const uint64_t waitBegin = telemetryEnabled ? telemetry::nowNs() : 0;
 #ifdef VKD3D_ENABLE_TEST_HOOKS
             m_testSleepDecision.wait_id = waitId;
             m_testSleepDecision.wait_satisfied =
@@ -93,11 +120,47 @@ namespace pacer {
                     return false;
                 m_testSleepDecision.exit_accounting_state = getAccountingState();
                 m_testSleepDecision.would_start_frame = m_testSleepDecision.wait_satisfied;
+                if (telemetryEnabled) {
+                telemetry::Event event;
+                event.type = telemetry::Type::Pacing;
+                event.deviceId = m_device->m_telemetryId;
+                event.phase = telemetry::Phase::Wait;
+                event.epochId = accountingState;
+                event.simulationId = frameId;
+                event.timestamp0 = telemetryEntry;
+                event.timestamp1 = waitBegin;
+                event.timestamp2 = telemetry::nowNs();
+                event.id0 = waitId;
+                event.id1 = gpuFinishedAtEntry;
+                event.id2 = cpuFinishedAtEntry;
+                event.count0 = m_frameSync.m_waitLatency;
+                event.value0 = int64_t(frameId) - int64_t(gpuFinishedAtEntry);
+                event.flags = 1;
+                telemetry::emit(event);
+                }
                 return true;
             }
 #endif
             if (!m_frameSync.gpuFinished.wait(waitId, 200,
                     m_accountingState, accountingState)) {
+                if (telemetryEnabled) {
+                telemetry::Event event;
+                event.type = telemetry::Type::Pacing;
+                event.deviceId = m_device->m_telemetryId;
+                event.phase = telemetry::Phase::Wait;
+                event.epochId = accountingState;
+                event.simulationId = frameId;
+                event.timestamp0 = telemetryEntry;
+                event.timestamp1 = waitBegin;
+                event.timestamp2 = telemetry::nowNs();
+                event.id0 = waitId;
+                event.id1 = gpuFinishedAtEntry;
+                event.id2 = cpuFinishedAtEntry;
+                event.count0 = m_frameSync.m_waitLatency;
+                event.value0 = int64_t(frameId) - int64_t(gpuFinishedAtEntry);
+                event.flags = getAccountingState() == accountingState ? 2 : 1;
+                telemetry::emit(event);
+                }
                 if (getAccountingState() != accountingState) {
 #ifdef VKD3D_ENABLE_TEST_HOOKS
                     m_testSleepDecision.exit_accounting_state = getAccountingState();
@@ -106,6 +169,23 @@ namespace pacer {
                 }
                 WARN( "timeout on waiting for gpu finish id %" PRIu64 " reached, resulting in stutter \n", waitId );
                 return true;
+            }
+            if (telemetryEnabled) {
+            telemetry::Event waitEvent;
+            waitEvent.type = telemetry::Type::Pacing;
+            waitEvent.deviceId = m_device->m_telemetryId;
+            waitEvent.phase = telemetry::Phase::Wait;
+            waitEvent.epochId = accountingState;
+            waitEvent.simulationId = frameId;
+            waitEvent.timestamp0 = telemetryEntry;
+            waitEvent.timestamp1 = waitBegin;
+            waitEvent.timestamp2 = telemetry::nowNs();
+            waitEvent.id0 = waitId;
+            waitEvent.id1 = gpuFinishedAtEntry;
+            waitEvent.id2 = cpuFinishedAtEntry;
+            waitEvent.count0 = m_frameSync.m_waitLatency;
+            waitEvent.value0 = int64_t(frameId) - int64_t(gpuFinishedAtEntry);
+            telemetry::emit(waitEvent);
             }
             // potentially wait some more if the cpu gets too much ahead
             std::lock_guard<dxvk::mutex> progressLock(m_progressMutex);
@@ -197,6 +277,13 @@ namespace pacer {
             uint64_t state = getAccountingState();
             return isReflexAccountingState(state) ? state : 0;
         }
+        uint64_t getExternalFrameId(uint64_t epoch, uint64_t simulationId) const {
+            return m_frameMapping.getFrameId(epoch, simulationId);
+        }
+        CalibratedDeviceTimestamps::Calibration getTelemetryCalibrationSnapshot() {
+            std::lock_guard<dxvk::mutex> progressLock(m_progressMutex);
+            return m_device->m_calibratedDeviceTimestamps.getCalibration();
+        }
         static bool isReflexAccountingState(uint64_t state) {
             return state & 1;
         }
@@ -219,9 +306,11 @@ namespace pacer {
                 void* swapchain, uint64_t sequence);
         void cancelReflexPresent(const PresentAttemptToken& attemptToken);
         void forceReflexPacingBypass();
-        void accountReflexCompletion(SubmitRecord& submit, void* commandQueue,
+        SubmitCompletionResult accountReflexCompletion(SubmitRecord& submit, void* commandQueue,
                 uint64_t commandGeneration, void* vulkanQueue,
-                uint64_t vulkanGeneration, uint64_t gpuTimestamp);
+                uint64_t vulkanGeneration, uint64_t gpuTimestamp,
+                uint64_t gpuExecutionStart, bool gpuExecutionStartAvailable,
+                SubmitTelemetryMetadata* telemetryMetadata);
         void abandonReflexSubmit(SubmitRecord& submit, void* commandQueue,
                 uint64_t commandGeneration, void* vulkanQueue,
                 uint64_t vulkanGeneration);

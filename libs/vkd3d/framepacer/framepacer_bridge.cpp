@@ -189,6 +189,18 @@ void pacer_queue_notify_submit_failed( struct pacer_queues pacer_queues,
         vulkanQueue->abandonSubmit(vulkan_submit_id);
 }
 
+void pacer_command_queue_set_observed_oob_role(
+        pacer_command_queue_handle command_queue, uint32_t type) {
+    if (!command_queue)
+        return;
+    telemetry::QueueRole role = telemetry::QueueRole::Unknown;
+    if (type == 0)
+        role = telemetry::QueueRole::OobRender;
+    else if (type == 1)
+        role = telemetry::QueueRole::OobPresent;
+    COMMAND_QUEUE(command_queue)->setTelemetryQueueRole(role);
+}
+
 
 uint64_t pacer_vulkan_queue_notify_submit( pacer_vulkan_queue_handle vulkan_queue ) {
     assert(vulkan_queue);
@@ -261,12 +273,27 @@ pacer_present_attempt_token pacer_begin_present_attempt(
 }
 
 uint64_t pacer_notify_present( pacer_device_handle device, void* vkd3d_swapchain,
-        uint64_t presentation_sequence, pacer_present_attempt_token rawAttempt ) {
+        uint64_t presentation_sequence, pacer_present_attempt_token rawAttempt,
+        uint64_t dxgiPresentEntryNs ) {
     assert(device);
     assert(vkd3d_swapchain);
     CommandQueue* commandQueue = DEVICE(device)->m_primaryCommandQueue;
     PresentAttemptToken attempt = import_present_attempt(rawAttempt);
     uint64_t currentState = DEVICE(device)->m_pacer->getAccountingState();
+    if (telemetry::isEnabled()) {
+    telemetry::Event presentEvent;
+    presentEvent.type = telemetry::Type::Present;
+    presentEvent.deviceId = DEVICE(device)->m_telemetryId;
+    presentEvent.phase = telemetry::Phase::DxgiEntry;
+    presentEvent.epochId = attempt.accountingEpoch;
+    presentEvent.simulationId = attempt.simulationId;
+    presentEvent.externalReflexId = DEVICE(device)->m_pacer->getExternalFrameId(
+            attempt.accountingEpoch, attempt.simulationId);
+    presentEvent.id0 = DEVICE(device)->getSwapchainTelemetryId(vkd3d_swapchain);
+    presentEvent.id1 = presentation_sequence;
+    presentEvent.timestamp0 = dxgiPresentEntryNs;
+    telemetry::emit(presentEvent);
+    }
 
     if (!attempt || attempt.threadId != dxvk::this_thread::get_id()) {
         DEVICE(device)->m_pacer->forceReflexPacingBypass();
@@ -298,6 +325,33 @@ uint64_t pacer_notify_present( pacer_device_handle device, void* vkd3d_swapchain
 
     // return a frame_id when we'll make use of it (present_timing, present_wait, etc.)
     return 0;
+}
+
+void pacer_notify_vk_present(pacer_device_handle device, void* vkd3d_swapchain,
+        uint64_t presentation_sequence, uint64_t accounting_epoch,
+        uint64_t simulation_id, uint64_t external_reflex_id) {
+    if (!device || !vkd3d_swapchain)
+        return;
+    telemetry::Event event;
+    event.type = telemetry::Type::Present;
+    event.deviceId = DEVICE(device)->m_telemetryId;
+    event.phase = telemetry::Phase::VkPresent;
+    event.epochId = accounting_epoch;
+    event.simulationId = simulation_id;
+    event.externalReflexId = external_reflex_id ? external_reflex_id
+            : DEVICE(device)->m_pacer->getExternalFrameId(
+                    accounting_epoch, simulation_id);
+    event.id0 = DEVICE(device)->getSwapchainTelemetryId(vkd3d_swapchain);
+    event.id1 = presentation_sequence;
+    telemetry::emit(event);
+}
+
+uint64_t pacer_telemetry_now_ns(void) {
+    return telemetry::nowNs();
+}
+
+bool pacer_telemetry_enabled(void) {
+    return telemetry::isEnabled();
 }
 
 void pacer_notify_aborted_present( pacer_device_handle device,

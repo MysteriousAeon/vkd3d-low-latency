@@ -123,6 +123,9 @@ struct dxgi_vk_swap_chain_present_request
     uint32_t swap_interval;
     uint64_t pacer_frame_id;
     uint64_t low_latency_frame_id;
+    uint64_t telemetry_accounting_epoch;
+    uint64_t telemetry_simulation_id;
+    uint64_t telemetry_external_reflex_id;
     union
     {
         struct low_latency_state requested_low_latency_state;
@@ -1128,12 +1131,16 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
     struct dxgi_vk_swap_chain_present_request *request;
     struct vkd3d_queue_timeline_trace_cookie cookie;
     struct pacer_present_attempt_token pacer_attempt;
+    uint64_t telemetry_dxgi_entry_ns;
+    bool telemetry_enabled;
     bool low_latency_enable;
 
     TRACE("iface %p, SyncInterval %u, PresentFlags #%x, pPresentParameters %p.\n",
             iface, SyncInterval, PresentFlags, pPresentParameters);
     (void)pPresentParameters;
 
+    telemetry_enabled = pacer_telemetry_enabled();
+    telemetry_dxgi_entry_ns = telemetry_enabled ? pacer_telemetry_now_ns() : 0;
     pacer_attempt = pacer_begin_present_attempt(chain->queue->device->pacer_device);
 
     if (dxgi_vk_swap_chain_present_is_occluded(chain))
@@ -1156,7 +1163,8 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
     request = &chain->request_ring[chain->user.present_count % ARRAY_SIZE(chain->request_ring)];
 
     request->pacer_frame_id = pacer_notify_present(chain->queue->device->pacer_device,
-            chain, chain->user.present_count, pacer_attempt);
+            chain, chain->user.present_count, pacer_attempt,
+            telemetry_dxgi_entry_ns);
     request->swap_interval = SyncInterval;
     request->dxgi_format = chain->user.backbuffers[chain->user.index]->desc.Format;
     request->user_index = chain->user.index;
@@ -1165,6 +1173,11 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
     request->modifies_hdr_metadata = chain->user.modifies_hdr_metadata;
     request->begin_frame_time_ns = chain->user.begin_frame_time_ns;
     request->low_latency_frame_id = 0;
+    request->telemetry_accounting_epoch = telemetry_enabled
+            ? pacer_attempt.accounting_epoch : 0;
+    request->telemetry_simulation_id = telemetry_enabled
+            ? pacer_attempt.simulation_id : 0;
+    request->telemetry_external_reflex_id = 0;
 
     chain->user.modifies_hdr_metadata = false;
 
@@ -3159,6 +3172,12 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
     vkd3d_queue_timeline_trace_register_instantaneous(&chain->queue->device->queue_timeline_trace,
             VKD3D_QUEUE_TIMELINE_TRACE_STATE_TYPE_QUEUE_PRESENT,
             chain->present.present_id_valid ? chain->present.present_id : 0);
+
+    if (pacer_telemetry_enabled())
+        pacer_notify_vk_present(chain->queue->device->pacer_device, chain,
+                present_count, chain->request.telemetry_accounting_epoch,
+                chain->request.telemetry_simulation_id,
+                chain->request.telemetry_external_reflex_id);
 
     /* Handle any errors and retry as needed. If we cannot make meaningful forward progress, just give up and retry later. */
     if (vr == VK_SUBOPTIMAL_KHR || vr < 0)

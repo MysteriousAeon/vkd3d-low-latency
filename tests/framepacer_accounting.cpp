@@ -1,14 +1,18 @@
 #include "framepacer/framepacer_bridge.h"
+#include "framepacer/telemetry.h"
 #include "vkd3d_dxgi1_2.h"
 #include "vkd3d_test_hooks.h"
 
 #include <atomic>
 #include <cinttypes>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 
 extern "C"
@@ -20,6 +24,18 @@ union vkd3d_config_flags vkd3d_config_flags = {};
 static constexpr uint64_t fixed_gpu_timestamp = 0x12345678ull;
 static std::atomic<uintptr_t> next_handle = { 1 };
 static unsigned int failures;
+
+static void set_test_environment(const char *name, const char *value)
+{
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value)
+        setenv(name, value, 1);
+    else
+        unsetenv(name);
+#endif
+}
 
 #define check(condition, ...) do { \
     if (!(condition)) { \
@@ -280,7 +296,7 @@ struct fixture
         NvAPI_setLatencyMarker(device, external_id, VK_LATENCY_MARKER_PRESENT_START_NV);
         pacer_present_attempt_token attempt = pacer_begin_present_attempt(device);
         pacer_notify_present(device, &swapchain_token, ++presentation_sequence,
-                attempt);
+                attempt, 0);
         NvAPI_setLatencyMarker(device, external_id, VK_LATENCY_MARKER_PRESENT_END_NV);
     }
 
@@ -288,7 +304,7 @@ struct fixture
     {
         pacer_present_attempt_token attempt = pacer_begin_present_attempt(device);
         pacer_notify_present(device, &swapchain_token, ++presentation_sequence,
-                attempt);
+                attempt, 0);
     }
 
     pacer_present_attempt_token begin_present_attempt(uint64_t external_id)
@@ -302,7 +318,7 @@ struct fixture
             void *swapchain = nullptr)
     {
         pacer_notify_present(device, swapchain ? swapchain : &swapchain_token,
-                ++presentation_sequence, attempt);
+                ++presentation_sequence, attempt, 0);
     }
 
     void abort_present(pacer_present_attempt_token attempt)
@@ -689,7 +705,7 @@ static void run_inactive_present_case()
 
     NvAPI_setLatencyMarker(f.device, 101, VK_LATENCY_MARKER_PRESENT_START_NV);
     pacer_present_attempt_token attempt = pacer_begin_present_attempt(f.device);
-    pacer_notify_present(f.device, &inactive_swapchain, 1, attempt);
+    pacer_notify_present(f.device, &inactive_swapchain, 1, attempt, 0);
     NvAPI_setLatencyMarker(f.device, 101, VK_LATENCY_MARKER_PRESENT_END_NV);
     f.complete_gpu();
     state = f.snapshot();
@@ -1151,6 +1167,37 @@ static void run_device_construction_raii_case()
     std::printf("device-raii: C bridge contained adapter construction failure and joined the worker.\n");
 }
 
+static void run_telemetry_initialization_fail_open_case()
+{
+    const char *configured_path = std::getenv("VKD3D_FG_LATENCY_TELEMETRY");
+    std::string saved_path = configured_path ? configured_path : "";
+#ifdef _WIN32
+    const char *failure_path = "Z:\\tmp\\vkd3d-telemetry-device-init-failure.jsonl";
+#else
+    const char *failure_path = "/tmp/vkd3d-telemetry-device-init-failure.jsonl";
+#endif
+
+    for (const char *failure : {"allocation", "file", "thread"})
+    {
+        pacer::telemetry::testReset();
+        set_test_environment("VKD3D_FG_LATENCY_TELEMETRY", failure_path);
+        set_test_environment("VKD3D_TEST_TELEMETRY_INIT_FAILURE", failure);
+        fixture f(false, false);
+        check(f.device != nullptr,
+                "telemetry-init-%s: telemetry failure escaped into pacer device creation.\n",
+                failure);
+        check(!pacer::telemetry::isEnabled(),
+                "telemetry-init-%s: failed telemetry session was published.\n",
+                failure);
+    }
+
+    pacer::telemetry::testReset();
+    set_test_environment("VKD3D_TEST_TELEMETRY_INIT_FAILURE", nullptr);
+    set_test_environment("VKD3D_FG_LATENCY_TELEMETRY",
+            saved_path.empty() ? nullptr : saved_path.c_str());
+    std::printf("telemetry-init: allocation, file, and writer failures left device creation healthy.\n");
+}
+
 static vkd3d_test_capture_snapshot capture_snapshot(fixture& f,
         uint64_t generation = 0)
 {
@@ -1605,6 +1652,264 @@ static uint64_t reclaim_command_slot(fixture& f, uint64_t old_command_id)
                 ", got %" PRIu64 ".\n", expected, id);
     }
     return id;
+}
+
+static uint64_t reclaim_vulkan_slot(fixture& f, uint64_t old_vulkan_id);
+
+static void run_telemetry_completion_identity_case()
+{
+#ifdef _WIN32
+    const char *path = "Z:\\tmp\\vkd3d-telemetry-completion-identity.jsonl";
+#else
+    const char *path = "/tmp/vkd3d-telemetry-completion-identity.jsonl";
+#endif
+    static constexpr uint64_t newer_submit_timestamp = 0x6d65746164617461ull;
+    static constexpr uint64_t old_gpu_start = fixed_gpu_timestamp - 2;
+    static constexpr uint64_t newer_gpu_start = fixed_gpu_timestamp - 1;
+    std::remove(path);
+    check(pacer::telemetry::testInitialize(path, 3, 64),
+            "telemetry-completion: failed to initialize telemetry session.\n");
+    uint64_t old_command = 0;
+    uint64_t old_vulkan = 0;
+    uint64_t newer_command = 0;
+    uint64_t newer_vulkan = 0;
+    {
+        fixture f(true, false);
+        fixture::submit_pair old = f.submit();
+        old_command = old.command;
+        old_vulkan = old.vulkan;
+        pacer_test_set_vulkan_gpu_execution_start(f.queues.vulkan_queue,
+                old.vulkan, old_gpu_start);
+        NvAPI_setLatencyMarker(f.device, 101,
+                VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
+        f.present(101);
+        f.complete_gpu(old.command, old.vulkan);
+
+        reclaim_command_slot(f, old.command);
+        for (uint64_t i = 0; i < 2047; i++)
+            pacer_command_queue_notify_legacy_submit(f.queues.command_queue);
+        f.begin_simulation(102);
+        fixture::submit_pair newer = {};
+        newer.command = pacer_command_queue_notify_submit(f.queues.command_queue);
+        check(newer.command != 0,
+                "telemetry-completion: failed to allocate captured command submit.\n");
+        check(pacer_test_set_command_submit_timestamp(f.queues.command_queue,
+                newer.command, newer_submit_timestamp),
+                "telemetry-completion: failed to stamp captured command slot.\n");
+        newer.vulkan = pacer_vulkan_queue_notify_submit(f.queues.vulkan_queue);
+        check(newer.vulkan != 0 && pacer_command_queue_notify_vulkan_submit(
+                f.queues.command_queue, newer.command, newer.vulkan),
+                "telemetry-completion: failed to publish stamped captured submit.\n");
+        newer_command = newer.command;
+        newer_vulkan = newer.vulkan;
+        pacer_test_set_vulkan_gpu_execution_start(f.queues.vulkan_queue,
+                newer.vulkan, newer_gpu_start);
+        check(newer.command == old.command + 4096,
+                "telemetry-completion: SubmitRecord slot was not reused (%" PRIu64 ").\n",
+                newer.command);
+        /* Publish this generation while NORMAL, then mutate queue state and
+         * force the former telemetry-claim/accounting-acceptance interleave. */
+        pacer_command_queue_set_observed_oob_role(f.queues.command_queue, 0);
+        command_ring_barrier barrier;
+        arm_command_ring_barrier(f, barrier,
+                VKD3D_TEST_COMMAND_RING_COMPLETION_BEFORE_ACCOUNTING);
+        std::thread first([&]() { f.complete_gpu(newer.command, newer.vulkan); });
+        wait_command_ring_barrier(barrier);
+        std::thread second([&]() { f.complete_gpu(newer.command, newer.vulkan); });
+        second.join();
+        release_command_ring_barrier(f, barrier);
+        first.join();
+        f.complete_gpu(old.command, old.vulkan);
+    }
+    pacer::telemetry::shutdown();
+
+    std::ifstream stream(path);
+    std::string line;
+    unsigned completions = 0;
+    bool oldExact = false;
+    bool newerExact = false;
+    bool newerRoleExact = false;
+    bool mixedGeneration = false;
+    bool truthfulFrontier = false;
+    const std::string oldIdentity = "\"command_submit_id\":" +
+            std::to_string(old_command) + ",\"vulkan_queue_id\":1,\"vulkan_submit_id\":" +
+            std::to_string(old_vulkan);
+    const std::string newerIdentity = "\"command_submit_id\":" +
+            std::to_string(newer_command) + ",\"vulkan_queue_id\":1,\"vulkan_submit_id\":" +
+            std::to_string(newer_vulkan);
+    while (std::getline(stream, line))
+    {
+        truthfulFrontier |= line.find("\"record_type\":\"GPU_FRONTIER\"") !=
+                std::string::npos && line.find("\"simulation_id\":2") !=
+                std::string::npos && line.find("\"published_submit_count\":1") !=
+                std::string::npos && line.find("\"completed_submit_count\":1") !=
+                std::string::npos;
+        if (line.find("\"record_type\":\"SUBMIT\"") == std::string::npos ||
+                line.find("\"flags\":2") == std::string::npos)
+            continue;
+        completions++;
+        oldExact |= line.find(oldIdentity) != std::string::npos &&
+                line.find("\"simulation_id\":2") != std::string::npos &&
+                line.find("\"capture_generation\":1") != std::string::npos;
+        newerExact |= line.find(newerIdentity) != std::string::npos &&
+                line.find("\"simulation_id\":3") != std::string::npos &&
+                line.find("\"capture_generation\":2") != std::string::npos;
+        newerRoleExact |= line.find(newerIdentity) != std::string::npos &&
+                line.find("\"simulation_id\":3") != std::string::npos &&
+                line.find("\"publication_cpu_timestamp_ns\":" +
+                        std::to_string(newer_submit_timestamp)) != std::string::npos &&
+                line.find("\"queue_role\":\"NORMAL\"") != std::string::npos;
+        mixedGeneration |= line.find(oldIdentity) != std::string::npos &&
+                line.find("\"publication_cpu_timestamp_ns\":" +
+                        std::to_string(newer_submit_timestamp)) != std::string::npos;
+    }
+    check(completions == 2 && oldExact && newerExact && newerRoleExact &&
+            truthfulFrontier && !mixedGeneration,
+            "telemetry-completion: accepted completions were duplicated, mixed, relabeled, "
+            "or emitted false frontier counts (count %u, old %u, new %u, role %u, frontier %u, mixed %u).\n",
+            completions, oldExact, newerExact, newerRoleExact, truthfulFrontier,
+            mixedGeneration);
+    pacer::telemetry::testReset();
+    std::printf("telemetry-completion: accepted completion, generation role, and frontier counts stayed exact under a forced duplicate race.\n");
+}
+
+static fixture::submit_pair submit_telemetry_captured(fixture& f,
+        uint64_t publication_timestamp, uint64_t gpu_start)
+{
+    fixture::submit_pair submit = {};
+
+    submit.command = pacer_command_queue_notify_submit(f.queues.command_queue);
+    check(submit.command != 0,
+            "telemetry-metadata: failed to allocate captured command submit.\n");
+    check(pacer_test_set_command_submit_timestamp(f.queues.command_queue,
+            submit.command, publication_timestamp),
+            "telemetry-metadata: failed to stamp captured command submit.\n");
+    submit.vulkan = pacer_vulkan_queue_notify_submit(f.queues.vulkan_queue);
+    check(submit.vulkan != 0,
+            "telemetry-metadata: failed to allocate captured Vulkan submit.\n");
+    pacer_test_set_vulkan_gpu_execution_start(f.queues.vulkan_queue,
+            submit.vulkan, gpu_start);
+    check(pacer_command_queue_notify_vulkan_submit(f.queues.command_queue,
+            submit.command, submit.vulkan),
+            "telemetry-metadata: failed to publish captured submit.\n");
+    return submit;
+}
+
+static bool telemetry_completion_exact(const std::string& line,
+        const fixture::submit_pair& submit, uint64_t publication_timestamp,
+        uint64_t gpu_start)
+{
+    return line.find("\"record_type\":\"SUBMIT\"") != std::string::npos &&
+            line.find("\"flags\":2") != std::string::npos &&
+            line.find("\"command_submit_id\":" + std::to_string(submit.command)) !=
+                    std::string::npos &&
+            line.find("\"vulkan_submit_id\":" + std::to_string(submit.vulkan)) !=
+                    std::string::npos &&
+            line.find("\"publication_cpu_timestamp_ns\":" +
+                    std::to_string(publication_timestamp)) != std::string::npos &&
+            line.find("\"gpu_top_raw\":" + std::to_string(gpu_start)) !=
+                    std::string::npos;
+}
+
+static void run_telemetry_completion_metadata_lifetime_case()
+{
+#ifdef _WIN32
+    const char *command_path = "Z:\\tmp\\vkd3d-telemetry-command-reclaim.jsonl";
+    const char *vulkan_path = "Z:\\tmp\\vkd3d-telemetry-vulkan-reclaim.jsonl";
+#else
+    const char *command_path = "/tmp/vkd3d-telemetry-command-reclaim.jsonl";
+    const char *vulkan_path = "/tmp/vkd3d-telemetry-vulkan-reclaim.jsonl";
+#endif
+    static constexpr uint64_t command_publication_timestamp = 0x1111222233334444ull;
+    static constexpr uint64_t command_gpu_start = fixed_gpu_timestamp - 4;
+    static constexpr uint64_t vulkan_publication_timestamp = 0x123456789abcdef0ull;
+    static constexpr uint64_t vulkan_gpu_start = fixed_gpu_timestamp - 3;
+
+    std::remove(command_path);
+    check(pacer::telemetry::testInitialize(command_path, 3, 64),
+            "telemetry-command-reclaim: failed to initialize telemetry session.\n");
+    fixture::submit_pair command_submit = {};
+    {
+        fixture f(true, false);
+        command_submit = submit_telemetry_captured(f, command_publication_timestamp,
+                command_gpu_start);
+        f.disable_reflex();
+        uint64_t reclaimed = reclaim_command_slot(f, command_submit.command);
+        check(reclaimed == command_submit.command + 2048,
+                "telemetry-command-reclaim: command slot did not reclaim S.\n");
+        f.complete_gpu(command_submit.command, command_submit.vulkan);
+    }
+    pacer::telemetry::shutdown();
+
+    {
+        std::ifstream stream(command_path);
+        std::string line;
+        unsigned completions = 0;
+        bool exact = false;
+        while (std::getline(stream, line))
+        {
+            if (line.find("\"record_type\":\"SUBMIT\"") == std::string::npos ||
+                    line.find("\"flags\":2") == std::string::npos)
+                continue;
+            completions++;
+            exact |= telemetry_completion_exact(line, command_submit,
+                    command_publication_timestamp, command_gpu_start);
+        }
+        check(completions == 1 && exact,
+                "telemetry-command-reclaim: first accepted completion lost S metadata "
+                "after command-slot reuse (count %u, exact %u).\n", completions, exact);
+    }
+    pacer::telemetry::testReset();
+
+    std::remove(vulkan_path);
+    check(pacer::telemetry::testInitialize(vulkan_path, 3, 64),
+            "telemetry-vulkan-reclaim: failed to initialize telemetry session.\n");
+    fixture::submit_pair vulkan_submit = {};
+    {
+        fixture f(true, false);
+        vulkan_submit = submit_telemetry_captured(f, vulkan_publication_timestamp,
+                vulkan_gpu_start);
+        command_ring_barrier barrier;
+        arm_command_ring_barrier(f, barrier,
+                VKD3D_TEST_COMMAND_RING_COMPLETION_AFTER_ACCOUNTING);
+        std::thread first([&]() { f.complete_gpu(vulkan_submit.command, vulkan_submit.vulkan); });
+        wait_command_ring_barrier(barrier);
+
+        std::thread duplicate([&]() {
+            f.complete_gpu(vulkan_submit.command, vulkan_submit.vulkan);
+        });
+        duplicate.join();
+        uint64_t reclaimed = reclaim_vulkan_slot(f, vulkan_submit.vulkan);
+        pacer_test_set_vulkan_gpu_execution_start(f.queues.vulkan_queue,
+                reclaimed, vulkan_gpu_start + 1);
+        check(reclaimed == vulkan_submit.vulkan + 2048,
+                "telemetry-vulkan-reclaim: duplicate callback did not enable Vulkan reuse.\n");
+
+        release_command_ring_barrier(f, barrier);
+        first.join();
+    }
+    pacer::telemetry::shutdown();
+
+    {
+        std::ifstream stream(vulkan_path);
+        std::string line;
+        unsigned completions = 0;
+        bool exact = false;
+        while (std::getline(stream, line))
+        {
+            if (line.find("\"record_type\":\"SUBMIT\"") == std::string::npos ||
+                    line.find("\"flags\":2") == std::string::npos)
+                continue;
+            completions++;
+            exact |= telemetry_completion_exact(line, vulkan_submit,
+                    vulkan_publication_timestamp, vulkan_gpu_start);
+        }
+        check(completions == 1 && exact,
+                "telemetry-vulkan-reclaim: accepted callback lost S GPU start after "
+                "duplicate retirement/reuse (count %u, exact %u).\n", completions, exact);
+    }
+    pacer::telemetry::testReset();
+    std::printf("telemetry-metadata: captured completion kept immutable command and Vulkan metadata across reuse.\n");
 }
 
 static void advance_vulkan_before_reclaim(fixture& f, uint64_t old_vulkan_id)
@@ -2410,6 +2715,7 @@ int main()
         event_type::present, event_type::present, event_type::gpu_completion,
     };
 
+    run_telemetry_initialization_fail_open_case();
     run_fg_case("A", case_a);
     run_fg_case("B", case_b);
     run_fg_case("C", case_c);
@@ -2468,6 +2774,8 @@ int main()
     run_command_ring_present_snapshot_case();
     run_command_ring_completion_cases();
     run_command_ring_iterator_case();
+    run_telemetry_completion_identity_case();
+    run_telemetry_completion_metadata_lifetime_case();
 
     if (failures)
     {

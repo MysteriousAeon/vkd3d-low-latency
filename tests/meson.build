@@ -75,3 +75,19 @@ framepacer_accounting_test = executable('framepacer-accounting',
   cpp_args            : vkd3d_test_flags)
 
 test('framepacer-accounting', framepacer_accounting_test)
+
+framepacer_telemetry_test = executable('framepacer-telemetry',
+  'framepacer_telemetry.cpp',
+  '../libs/vkd3d/framepacer/telemetry.cpp',
+  dependencies        : [ threads_dep ],
+  include_directories : [ vkd3d_private_includes, include_directories('../libs/vkd3d') ],
+  install             : false,
+  cpp_args            : vkd3d_test_flags)
+
+test('framepacer-telemetry', framepacer_telemetry_test)
+
+python = import('python').find_installation('python3')
+test('framepacer-telemetry-analyzer', python,
+  args : [files('framepacer_telemetry_analyzer.py'),
+          join_paths(meson.current_source_dir(), '..', 'programs',
+                     'vkd3d-fg-latency-analyze.py')])

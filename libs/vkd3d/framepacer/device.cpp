@@ -98,7 +98,9 @@ namespace pacer {
 
     void Device::registerSwapchain( void* vkd3d_swapchain, void* vkd3d_command_queue, DXGI_SWAP_CHAIN_DESC1 desc, vkd3d_native_sync_handle* latency_event) {
         {   std::lock_guard<dxvk::mutex> lock(m_swapchainMutex);
-            m_swapchains.push_back({vkd3d_swapchain, vkd3d_command_queue, desc, latency_event});
+            m_swapchains.push_back({vkd3d_swapchain, vkd3d_command_queue, desc,
+                    latency_event, telemetry::isEnabled()
+                            ? telemetry::allocateSwapchainId() : 0});
             selectBestSwapchain_locked(); }
         INFO( "swapchain (%" PRIu64 ") registered to pacer \n", (uintptr_t) vkd3d_swapchain );
     }
@@ -121,6 +123,12 @@ namespace pacer {
         if (it != m_swapchains.end())
             return it->latency_event;
         return nullptr;
+    }
+
+    uint64_t Device::getSwapchainTelemetryId(void* vkd3d_swapchain) {
+        std::lock_guard<dxvk::mutex> lock(m_swapchainMutex);
+        auto it = findSwapchain_locked(vkd3d_swapchain);
+        return it != m_swapchains.end() ? it->telemetryId : 0;
     }
 
     void Device::getCommandQueues( std::vector<CommandQueue*>& outQueues ) {

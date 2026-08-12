@@ -40,6 +40,9 @@ namespace pacer {
                 m_frameSync.m_waitLatency = latency_override;
         }
 
+        telemetry::initialize(m_frameSync.m_waitLatency);
+        m_device->m_telemetryId = telemetry::allocateDeviceId();
+
         // todo: add env var mode selection
 
         if (!m_device->m_calibratedDeviceTimestamps.canEnable() && mode != FramePacerMode::MIN_LATENCY) {
@@ -222,13 +225,18 @@ namespace pacer {
             m_simulationLedger.forcePacingBypass();
     }
 
-    void FramePacer::accountReflexCompletion(SubmitRecord& submit,
+    SubmitCompletionResult FramePacer::accountReflexCompletion(SubmitRecord& submit,
             void* commandQueue, uint64_t commandGeneration, void* vulkanQueue,
-            uint64_t vulkanGeneration, uint64_t gpuTimestamp) {
+            uint64_t vulkanGeneration, uint64_t gpuTimestamp,
+            uint64_t gpuExecutionStart, bool gpuExecutionStartAvailable,
+            SubmitTelemetryMetadata* telemetryMetadata) {
         std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        SubmitCompletionResult result;
         applySimulationProgress(m_simulationLedger.accountCompletion(submit,
                 commandQueue, commandGeneration, vulkanQueue,
-                vulkanGeneration, gpuTimestamp));
+                vulkanGeneration, gpuTimestamp, gpuExecutionStart,
+                gpuExecutionStartAvailable, &result, telemetryMetadata));
+        return result;
     }
 
     void FramePacer::abandonReflexSubmit(SubmitRecord& submit,
@@ -277,6 +285,19 @@ namespace pacer {
                 markers.gpuFinished = timestamp;
             });
             m_frameSync.gpuFinished.signal(completion.simulationId);
+            if (telemetry::isEnabled()) {
+            telemetry::Event event;
+            event.type = telemetry::Type::GpuFrontier;
+            event.deviceId = m_device->m_telemetryId;
+            event.epochId = progress.accountingEpoch;
+            event.simulationId = completion.simulationId;
+            event.timestamp0 = completion.gpuTimestamp;
+            event.timestamp1 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    timestamp.time_since_epoch()).count();
+            event.count0 = completion.publishedSubmits;
+            event.count1 = completion.completedSubmits;
+            telemetry::emit(event);
+            }
             LatencyMarkers markers = m_latencyMarkers.getMarkers(
                     progress.accountingEpoch, completion.simulationId);
             if (markers.start != time_point{})

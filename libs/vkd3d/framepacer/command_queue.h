@@ -4,6 +4,7 @@
 #include "nvapi_pacing_adapter.h"
 #include "simulation_ledger.h"
 #include "util/util_time.h"
+#include "telemetry.h"
 
 namespace pacer {
 
@@ -102,15 +103,26 @@ namespace pacer {
         // this method is accessed single threaded
         bool notifyVulkanSubmit( uint64_t commandId, uint64_t vulkanId ) {
             uint16_t index = commandId % NUM_SUBMITS;
-            const bool captured = m_device->m_pacer->m_simulationLedger.ownsSubmit(
-                    m_ledgerSubmits[index], this, commandId);
             void* rollbackVulkanQueue = nullptr;
             uint64_t rollbackVulkanGeneration = 0;
+            const telemetry::QueueRole submissionRole =
+                    m_telemetryRole.load(std::memory_order_relaxed);
+            SubmitTelemetryMetadata capturedMetadata;
+            SlotSnapshot publicationSnapshot;
+            const bool publicationAvailable = telemetry::isEnabled() &&
+                    snapshotSlot(commandId, &publicationSnapshot) &&
+                    publicationSnapshot.submit != time_point{};
+            SubmitPublicationResult publication =
+                    m_device->m_pacer->m_simulationLedger.publishVulkanSubmit(
+                            m_ledgerSubmits[index], this, commandId,
+                            m_vulkanQueue, vulkanId, static_cast<uint8_t>(submissionRole),
+                            publicationSnapshot.submit.time_since_epoch().count(),
+                            publicationAvailable,
+                            &rollbackVulkanQueue,
+                            &rollbackVulkanGeneration, &capturedMetadata);
+            const bool captured = publication != SubmitPublicationResult::NotCaptured;
 
-            if (captured && !m_device->m_pacer->m_simulationLedger.publishVulkanSubmit(
-                    m_ledgerSubmits[index], this, commandId,
-                    m_vulkanQueue, vulkanId, &rollbackVulkanQueue,
-                    &rollbackVulkanGeneration)) {
+            if (publication == SubmitPublicationResult::Rejected) {
                 m_device->m_pacer->abandonReflexSubmit(m_ledgerSubmits[index],
                         this, commandId, rollbackVulkanQueue,
                         rollbackVulkanGeneration);
@@ -124,6 +136,11 @@ namespace pacer {
                 if (commandId &&
                         m_submitGenerations[index].load(std::memory_order_relaxed) == commandId) {
                     m_vulkanQueueIds[index].store(vulkanId, std::memory_order_relaxed);
+                    if (!publicationAvailable)
+                        publicationSnapshot.submit = m_submits[index].load(std::memory_order_relaxed);
+                    publicationSnapshot.vulkanId = vulkanId;
+                    publicationSnapshot.queueRole = submissionRole;
+                    m_submitTelemetryRoles[index] = submissionRole;
                     published = true;
                 }
             }
@@ -133,7 +150,33 @@ namespace pacer {
                 m_device->m_pacer->abandonReflexSubmit(m_ledgerSubmits[index],
                         this, commandId, rollbackVulkanQueue,
                         rollbackVulkanGeneration);
+            if (published && telemetry::isEnabled() &&
+                    (!captured || capturedMetadata.publicationAvailable)) {
+                telemetry::Event event;
+                event.type = telemetry::Type::Submit;
+                event.deviceId = m_device->m_telemetryId;
+                event.epochId = captured ? capturedMetadata.accountingEpoch
+                        : m_device->m_pacer->getAccountingState();
+                event.simulationId = captured ? capturedMetadata.simulationId : 0;
+                event.captureGeneration = captured
+                        ? capturedMetadata.captureGeneration : 0;
+                event.id0 = uint64_t(m_properties.id) + 1;
+                event.id1 = commandId;
+                event.id2 = uint64_t(m_vulkanQueue->m_properties.id) + 1;
+                event.timestamp0 = vulkanId;
+                event.timestamp1 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        publicationSnapshot.submit.time_since_epoch()).count();
+                event.queueRole = publicationSnapshot.queueRole;
+                event.captureClass = captured ? telemetry::CaptureClass::RenderCaptured
+                        : telemetry::CaptureClass::Uncaptured;
+                event.flags = 1; /* publication */
+                telemetry::emit(event);
+            }
             return published;
+        }
+
+        void setTelemetryQueueRole(telemetry::QueueRole role) {
+            m_telemetryRole.store(role, std::memory_order_relaxed);
         }
 
         void notifyLegacyPresent( void* vkd3d_swapchain,
@@ -187,27 +230,109 @@ namespace pacer {
         void notifyVulkanGpuExecutionEnd( uint64_t commandId, uint64_t vulkanId,
                 uint64_t gpuTimestamp ) {
             uint16_t index = commandId % NUM_SUBMITS;
+            const bool telemetryEnabled = telemetry::isEnabled();
 
-            if (m_device->m_pacer->m_simulationLedger.ownsSubmit(
-                    m_ledgerSubmits[index], this, commandId)) {
-                m_device->m_pacer->accountReflexCompletion(m_ledgerSubmits[index],
-                        this, commandId, m_vulkanQueue, vulkanId, gpuTimestamp);
+            auto completeLegacy = [&] {
+                uint64_t presentEpoch = 0;
+                if (gpuTimestamp) {
+                    std::lock_guard<dxvk::mutex> lock(m_slotMutexes[index]);
+                    if (m_submitGenerations[index].load(std::memory_order_relaxed) == commandId &&
+                            m_vulkanQueueIds[index].load(std::memory_order_relaxed) == vulkanId &&
+                            m_presentFlags[index].load(std::memory_order_relaxed)) {
+                        presentEpoch = m_presentEpochs[index].load(std::memory_order_relaxed);
+                        m_presentFlags[index].store(false, std::memory_order_relaxed);
+                    }
+                }
+                testHook(TestHookPoint::CompletionAfterSlot);
+                if (presentEpoch)
+                    m_device->m_pacer->finishRender(gpuTimestamp, presentEpoch);
+            };
+
+            /* Preserve the Layer-1 disabled path: an early legacy completion
+             * only checks ledger ownership and then uses its slot-local path. */
+            if (!telemetryEnabled) {
+                if (m_device->m_pacer->m_simulationLedger.ownsSubmit(
+                        m_ledgerSubmits[index], this, commandId))
+                    m_device->m_pacer->accountReflexCompletion(m_ledgerSubmits[index],
+                            this, commandId, m_vulkanQueue, vulkanId, gpuTimestamp,
+                            0, false, nullptr);
+                else
+                    completeLegacy();
                 return;
             }
 
-            uint64_t presentEpoch = 0;
-            if (gpuTimestamp) {
-                std::lock_guard<dxvk::mutex> lock(m_slotMutexes[index]);
-                if (m_submitGenerations[index].load(std::memory_order_relaxed) == commandId &&
-                        m_vulkanQueueIds[index].load(std::memory_order_relaxed) == vulkanId &&
-                        m_presentFlags[index].load(std::memory_order_relaxed)) {
-                    presentEpoch = m_presentEpochs[index].load(std::memory_order_relaxed);
-                    m_presentFlags[index].store(false, std::memory_order_relaxed);
-                }
+            SubmitTelemetryMetadata capturedMetadata;
+            uint64_t gpuStart = 0;
+            const bool gpuStartAvailable =
+                    m_vulkanQueue->snapshotGpuExecutionStart(vulkanId, &gpuStart) && gpuStart;
+            testHook(TestHookPoint::CompletionBeforeAccounting);
+            SubmitCompletionResult completion =
+                    m_device->m_pacer->accountReflexCompletion(m_ledgerSubmits[index],
+                            this, commandId, m_vulkanQueue, vulkanId, gpuTimestamp,
+                            gpuStart, gpuStartAvailable,
+                            &capturedMetadata);
+            const bool captured = completion != SubmitCompletionResult::NotCaptured;
+            if (completion == SubmitCompletionResult::Duplicate)
+                return;
+
+            SlotSnapshot commandSnapshot;
+            bool telemetryCompletionClaimed = false;
+            if (!captured) {
+                telemetryCompletionClaimed = claimTelemetryCompletionSlot(
+                        commandId, vulkanId, &commandSnapshot);
+                completeLegacy();
             }
-            testHook(TestHookPoint::CompletionAfterSlot);
-            if (presentEpoch)
-                m_device->m_pacer->finishRender(gpuTimestamp, presentEpoch);
+
+            testHook(TestHookPoint::CompletionAfterAccounting);
+
+            /* Captured telemetry is emitted only by the callback whose ledger
+             * completion was accepted. Its identity and role come from that
+             * immutable ledger generation; a physical slot may already be gone. */
+            const bool capturedTelemetryAvailable = captured &&
+                    capturedMetadata.publicationAvailable &&
+                    capturedMetadata.gpuExecutionStartAvailable;
+            if (telemetryEnabled && (capturedTelemetryAvailable ||
+                    (telemetryCompletionClaimed && gpuStartAvailable))) {
+                gpuStart = captured ? capturedMetadata.gpuExecutionStart : gpuStart;
+                const auto calibration =
+                        m_device->m_pacer->getTelemetryCalibrationSnapshot();
+                auto topHost = m_device->m_calibratedDeviceTimestamps.getHostTimestamp(
+                        gpuStart, calibration);
+                auto bottomHost = m_device->m_calibratedDeviceTimestamps.getHostTimestamp(
+                        gpuTimestamp, calibration);
+                telemetry::Event event;
+                event.type = telemetry::Type::Submit;
+                event.deviceId = m_device->m_telemetryId;
+                event.epochId = captured ? capturedMetadata.accountingEpoch
+                        : m_device->m_pacer->getAccountingState();
+                event.simulationId = captured ? capturedMetadata.simulationId : 0;
+                event.captureGeneration = captured
+                        ? capturedMetadata.captureGeneration : 0;
+                event.id0 = uint64_t(m_properties.id) + 1;
+                event.id1 = commandId;
+                event.id2 = uint64_t(m_vulkanQueue->m_properties.id) + 1;
+                event.timestamp0 = vulkanId;
+                event.timestamp1 = captured ? capturedMetadata.publicationCpuTimestampNs
+                        : std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                commandSnapshot.submit.time_since_epoch()).count();
+                event.timestamp2 = gpuStart;
+                event.timestamp3 = gpuTimestamp;
+                event.value0 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        topHost.time_since_epoch()).count();
+                event.value1 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        bottomHost.time_since_epoch()).count();
+                event.value2 = calibration.deviceTimestamp;
+                event.value3 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        calibration.hostTimestamp.time_since_epoch()).count();
+                event.calibrationDeviationNs = calibration.maxDeviation;
+                event.queueRole = captured
+                        ? static_cast<telemetry::QueueRole>(capturedMetadata.queueRole)
+                        : commandSnapshot.queueRole;
+                event.captureClass = captured ? telemetry::CaptureClass::RenderCaptured
+                        : telemetry::CaptureClass::Uncaptured;
+                event.flags = 2; /* completion */
+                telemetry::emit(event);
+            }
         }
 
         void notifySubmitFailed(uint64_t commandId, uint64_t vulkanId) {
@@ -237,6 +362,8 @@ namespace pacer {
             PresentAfterSnapshot,
             PresentAfterClaim,
             CompletionAfterSlot,
+            CompletionBeforeAccounting,
+            CompletionAfterAccounting,
             IteratorAfterSnapshot,
         };
 #ifdef VKD3D_ENABLE_TEST_HOOKS
@@ -361,7 +488,23 @@ namespace pacer {
         struct SlotSnapshot {
             time_point submit = {};
             uint64_t vulkanId = INVALID_ID;
+            telemetry::QueueRole queueRole = telemetry::QueueRole::Unknown;
         };
+
+        bool claimTelemetryCompletionSlot(uint64_t commandId, uint64_t vulkanId,
+                SlotSnapshot* snapshot) {
+            uint16_t index = commandId % NUM_SUBMITS;
+            std::lock_guard<dxvk::mutex> lock(m_slotMutexes[index]);
+            if (m_submitGenerations[index].load(std::memory_order_relaxed) != commandId ||
+                    m_vulkanQueueIds[index].load(std::memory_order_relaxed) != vulkanId ||
+                    m_telemetryCompletionEmitted[index])
+                return false;
+            snapshot->submit = m_submits[index].load(std::memory_order_relaxed);
+            snapshot->vulkanId = vulkanId;
+            snapshot->queueRole = m_submitTelemetryRoles[index];
+            m_telemetryCompletionEmitted[index] = true;
+            return true;
+        }
 
         bool snapshotSlot(uint64_t commandId, SlotSnapshot* snapshot) const {
             uint16_t index = commandId % NUM_SUBMITS;
@@ -370,6 +513,7 @@ namespace pacer {
                 return false;
             snapshot->submit = m_submits[index].load(std::memory_order_relaxed);
             snapshot->vulkanId = m_vulkanQueueIds[index].load(std::memory_order_relaxed);
+            snapshot->queueRole = m_submitTelemetryRoles[index];
             return true;
         }
 
@@ -378,6 +522,8 @@ namespace pacer {
             m_vulkanQueueIds[index].store(INVALID_ID, std::memory_order_relaxed);
             m_presentFlags[index].store(false, std::memory_order_relaxed);
             m_presentEpochs[index].store(0, std::memory_order_relaxed);
+            m_telemetryCompletionEmitted[index] = false;
+            m_submitTelemetryRoles[index] = telemetry::QueueRole::Unknown;
             m_submitGenerations[index].store(id, std::memory_order_relaxed);
         }
 
@@ -419,8 +565,11 @@ namespace pacer {
         std::array<std::atomic<bool>, NUM_SUBMITS>       m_presentFlags = { };
         std::array<std::atomic<uint64_t>, NUM_SUBMITS>   m_presentEpochs = { };
         std::array<SubmitRecord, NUM_SUBMITS>            m_ledgerSubmits = { };
+        std::array<bool, NUM_SUBMITS>                    m_telemetryCompletionEmitted = { };
+        std::array<telemetry::QueueRole, NUM_SUBMITS>    m_submitTelemetryRoles = { };
         mutable std::array<dxvk::mutex, NUM_SUBMITS>     m_slotMutexes;
         std::atomic<uint64_t> m_submitCounter = { 1 };
+        std::atomic<telemetry::QueueRole> m_telemetryRole = { telemetry::QueueRole::Normal };
 #ifdef VKD3D_ENABLE_TEST_HOOKS
         mutable dxvk::mutex m_testHookMutex;
         mutable dxvk::condition_variable m_testHookCond;

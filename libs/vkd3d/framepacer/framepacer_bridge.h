@@ -118,6 +118,8 @@ void pacer_command_queue_retire_capture(
     enum pacer_capture_retire_reason reason );
 bool     pacer_command_queue_notify_vulkan_submit( pacer_command_queue_handle command_queue, uint64_t command_submit_id, uint64_t vulkan_submit_id );
 void     pacer_queue_notify_submit_failed( struct pacer_queues pacer_queues, uint64_t command_submit_id, uint64_t vulkan_submit_id );
+void     pacer_command_queue_set_observed_oob_role(
+    pacer_command_queue_handle command_queue, uint32_t type);
 
 void     pacer_queue_notify_gpu_execution_end( struct pacer_queues pacer_queues, uint64_t command_submit_id, uint64_t vulkan_submit_id, struct pacer_query_pool* query_pool );
 
@@ -130,9 +132,15 @@ void pacer_vulkan_queue_push_query_pool_top_of_pipe( pacer_vulkan_queue_handle v
 struct pacer_present_attempt_token pacer_begin_present_attempt(
     pacer_device_handle device );
 uint64_t pacer_notify_present( pacer_device_handle device, void* vkd3d_swapchain,
-    uint64_t presentation_sequence, struct pacer_present_attempt_token attempt );
+    uint64_t presentation_sequence, struct pacer_present_attempt_token attempt,
+    uint64_t dxgi_present_entry_ns );
 void pacer_notify_aborted_present( pacer_device_handle device, void* vkd3d_swapchain,
     struct pacer_present_attempt_token attempt );
+void pacer_notify_vk_present( pacer_device_handle device, void* vkd3d_swapchain,
+        uint64_t presentation_sequence, uint64_t accounting_epoch,
+        uint64_t simulation_id, uint64_t external_reflex_id );
+uint64_t pacer_telemetry_now_ns(void);
+bool pacer_telemetry_enabled(void);
 
 //void pacer_notify_gpu_present_end( pacer_device_handle handle, uint64_t frameId );
 

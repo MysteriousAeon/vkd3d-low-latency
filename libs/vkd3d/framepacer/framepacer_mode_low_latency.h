@@ -5,6 +5,7 @@
 #include "threaded_sleep.h"
 #include "util/util_sleep.h"
 #include "util/util_log.h"
+#include "telemetry.h"
 #include <algorithm>
 
 namespace pacer {
@@ -99,7 +100,8 @@ namespace pacer {
 
             if (inFlight.numInFlight == 1) {
                 int32_t delay = getFpsLimiterDelay( lastStart, now );
-                sleepFor( now, delay );
+                emitDecision(generation, frameId, 0, 0, delay, delay, 0, false);
+                sleepFor(generation, frameId, now, delay);
                 _INFO( "we are the only in-flight frame, no sleep \n" );
                 return;
             }
@@ -109,11 +111,14 @@ namespace pacer {
             now = dxvk::high_resolution_clock::now();
             int32_t cpuDelay = getCpuDelay( props, inFlight, now, lastStart );
             int32_t gpuDelay = getGpuDelay( props, inFlight, now, lastStart );
-            int32_t delay = std::max( cpuDelay, getFpsLimiterDelay( lastStart, now ) );
+            int32_t limiterDelay = getFpsLimiterDelay(lastStart, now);
+            int32_t delay = std::max(cpuDelay, limiterDelay);
             delay = std::max( delay, gpuDelay );
+            emitDecision(generation, frameId, cpuDelay, gpuDelay, limiterDelay,
+                    delay, props.optimizedGpuTime, props.optimizedGpuTime != 0);
 //            delay = std::max( delay, getVrrDelay( frameId, props, now, lastFrameFinishPrediction ) );
             _INFO (" sleeping for %" PRIi32 " us \n", delay );
-            sleepFor( now, delay );
+            sleepFor(generation, frameId, now, delay);
 
         }
 
@@ -482,16 +487,54 @@ namespace pacer {
         }
 
 
-        void sleepFor( const dxvk::Sleep::TimePoint t, int32_t delay ) {
+        void emitDecision(uint64_t generation, uint64_t frameId,
+                int32_t cpuDelay, int32_t gpuDelay, int32_t limiterDelay,
+                int32_t selectedDelay, int32_t optimizedGpuTime,
+                bool predictionAvailable) {
+            if (!telemetry::isEnabled())
+                return;
+            telemetry::Event event;
+            event.type = telemetry::Type::Pacing;
+            event.deviceId = m_device->m_telemetryId;
+            event.phase = telemetry::Phase::Decision;
+            event.epochId = generation;
+            event.simulationId = frameId;
+            event.value0 = cpuDelay;
+            event.value1 = gpuDelay;
+            event.value2 = limiterDelay;
+            event.value3 = selectedDelay;
+            event.count0 = optimizedGpuTime > 0 ? uint32_t(optimizedGpuTime) : 0;
+            event.flags = predictionAvailable ? 4 : 0;
+            telemetry::emit(event);
+        }
+
+        void sleepFor(uint64_t generation, uint64_t frameId,
+                const dxvk::Sleep::TimePoint t, int32_t delay) {
 
             if (delay <= 0)
                 return;
 
+            int32_t selectedDelay = delay;
             int32_t maxDelay = std::max( m_fpsLimitFrametime.load(), 20000 );
             delay = std::min( delay, maxDelay );
 
             dxvk::Sleep::TimePoint t2 = t + microseconds(delay);
+            bool telemetryEnabled = telemetry::isEnabled();
+            uint64_t begin = telemetryEnabled ? telemetry::nowNs() : 0;
             m_threadedSleep.sleepUntil(t2);
+            if (telemetryEnabled) {
+            telemetry::Event event;
+            event.type = telemetry::Type::Pacing;
+            event.deviceId = m_device->m_telemetryId;
+            event.phase = telemetry::Phase::Sleep;
+            event.epochId = generation;
+            event.simulationId = frameId;
+            event.value0 = selectedDelay;
+            event.value1 = delay;
+            event.timestamp0 = begin;
+            event.timestamp1 = telemetry::nowNs();
+            telemetry::emit(event);
+            }
 
         }
 

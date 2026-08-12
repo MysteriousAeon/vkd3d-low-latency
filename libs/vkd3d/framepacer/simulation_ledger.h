@@ -102,8 +102,36 @@ namespace pacer {
         uint64_t accountingEpoch = 0;
         uint64_t captureGeneration = 0;
         uint64_t gpuTimestamp = 0;
+        /* Captured at Vulkan-submit publication and retained with the exact
+         * ledger generation until its accepted completion is accounted. */
+        uint64_t publicationCpuTimestampNs = 0;
+        uint8_t telemetryQueueRole = 0;
+        bool telemetryPublicationAvailable = false;
         bool published = false;
         bool completionAccounted = true;
+    };
+
+    struct SubmitTelemetryMetadata {
+        uint64_t accountingEpoch = 0;
+        uint64_t simulationId = 0;
+        uint64_t captureGeneration = 0;
+        uint64_t publicationCpuTimestampNs = 0;
+        uint64_t gpuExecutionStart = 0;
+        uint8_t queueRole = 0;
+        bool publicationAvailable = false;
+        bool gpuExecutionStartAvailable = false;
+    };
+
+    enum class SubmitPublicationResult : uint32_t {
+        NotCaptured,
+        Published,
+        Rejected,
+    };
+
+    enum class SubmitCompletionResult : uint32_t {
+        NotCaptured,
+        Accepted,
+        Duplicate,
     };
 
     struct SimulationRecord {
@@ -151,6 +179,8 @@ namespace pacer {
         struct GpuCompletion {
             uint64_t simulationId;
             uint64_t gpuTimestamp;
+            uint32_t publishedSubmits;
+            uint32_t completedSubmits;
         };
 
         std::vector<CpuCompletion> cpu;
@@ -212,16 +242,21 @@ namespace pacer {
                 void* commandQueue, uint64_t commandGeneration);
         SimulationProgress retireCaptureLease(const CaptureToken& token,
                 CaptureRetireReason reason);
-        bool publishVulkanSubmit(SubmitRecord& submit, void* commandQueue,
+        SubmitPublicationResult publishVulkanSubmit(SubmitRecord& submit, void* commandQueue,
                 uint64_t commandGeneration, void* vulkanQueue,
-                uint64_t vulkanGeneration, void** rollbackVulkanQueue,
-                uint64_t* rollbackVulkanGeneration);
+                uint64_t vulkanGeneration, uint8_t telemetryQueueRole,
+                uint64_t publicationCpuTimestampNs, bool publicationAvailable,
+                void** rollbackVulkanQueue,
+                uint64_t* rollbackVulkanGeneration,
+                SubmitTelemetryMetadata* telemetryMetadata);
         bool ownsSubmit(const SubmitRecord& submit, void* commandQueue,
                 uint64_t commandGeneration) const;
         SimulationProgress accountCompletion(SubmitRecord& submit,
                 void* commandQueue, uint64_t commandGeneration,
                 void* vulkanQueue, uint64_t vulkanGeneration,
-                uint64_t gpuTimestamp);
+                uint64_t gpuTimestamp, uint64_t gpuExecutionStart,
+                bool gpuExecutionStartAvailable, SubmitCompletionResult* result,
+                SubmitTelemetryMetadata* telemetryMetadata);
         SimulationProgress abandonSubmit(SubmitRecord& submit,
                 void* commandQueue, uint64_t commandGeneration,
                 void* vulkanQueue, uint64_t vulkanGeneration);

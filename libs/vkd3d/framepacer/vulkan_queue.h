@@ -112,8 +112,16 @@ namespace pacer {
         }
 
         uint64_t getGpuExecutionStart(uint64_t vulkanId) const {
+            uint64_t timestamp = 0;
+            return snapshotGpuExecutionStart(vulkanId, &timestamp) ? timestamp : 0;
+        }
+
+        bool snapshotGpuExecutionStart(uint64_t vulkanId, uint64_t* timestamp) const {
             SlotSnapshot snapshot;
-            return snapshotSlot(vulkanId, &snapshot) ? snapshot.gpuExecutionStart : 0;
+            if (!snapshotSlot(vulkanId, &snapshot))
+                return false;
+            *timestamp = snapshot.gpuExecutionStart;
+            return true;
         }
 
         pacer_query_pool* allocQueryPool() {

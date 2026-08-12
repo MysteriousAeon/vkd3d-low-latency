@@ -521,38 +521,51 @@ namespace pacer {
         return collectProgressLocked();
     }
 
-    bool SimulationLedger::publishVulkanSubmit(SubmitRecord& submit,
+    SubmitPublicationResult SimulationLedger::publishVulkanSubmit(SubmitRecord& submit,
             void* commandQueue, uint64_t commandGeneration, void* vulkanQueue,
-            uint64_t vulkanGeneration, void** rollbackVulkanQueue,
-            uint64_t* rollbackVulkanGeneration) {
+            uint64_t vulkanGeneration, uint8_t telemetryQueueRole,
+            uint64_t publicationCpuTimestampNs, bool publicationAvailable,
+            void** rollbackVulkanQueue,
+            uint64_t* rollbackVulkanGeneration,
+            SubmitTelemetryMetadata* telemetryMetadata) {
         std::lock_guard<dxvk::mutex> lock(m_mutex);
         *rollbackVulkanQueue = nullptr;
         *rollbackVulkanGeneration = 0;
-        if (submit.published && submit.commandQueue == commandQueue &&
-                submit.commandGeneration == commandGeneration) {
-            *rollbackVulkanQueue = submit.vulkanQueue;
-            *rollbackVulkanGeneration = submit.vulkanGeneration;
-        }
-        if (!submit.published || submit.completionAccounted ||
-                submit.commandQueue != commandQueue ||
-                submit.commandGeneration != commandGeneration ||
+        if (telemetryMetadata)
+            *telemetryMetadata = {};
+        if (!submit.published || submit.commandQueue != commandQueue ||
+                submit.commandGeneration != commandGeneration)
+            return SubmitPublicationResult::NotCaptured;
+        *rollbackVulkanQueue = submit.vulkanQueue;
+        *rollbackVulkanGeneration = submit.vulkanGeneration;
+        if (submit.completionAccounted ||
                 submit.vulkanGeneration) {
-            markTrackingFailureLocked(submit.published
-                    ? findSimulationLocked(submit.simulationId) : nullptr);
-            return false;
+            markTrackingFailureLocked(findSimulationLocked(submit.simulationId));
+            return SubmitPublicationResult::Rejected;
         }
         if (!m_epochActive || submit.accountingEpoch != m_activeEpoch)
-            return false;
+            return SubmitPublicationResult::Rejected;
         SimulationRecord* simulation = findSimulationLocked(submit.simulationId);
         if (!simulation) {
             markTrackingFailureLocked(nullptr);
-            return false;
+            return SubmitPublicationResult::Rejected;
         }
         submit.vulkanQueue = vulkanQueue;
         submit.vulkanGeneration = vulkanGeneration;
+        submit.telemetryQueueRole = telemetryQueueRole;
+        submit.publicationCpuTimestampNs = publicationCpuTimestampNs;
+        submit.telemetryPublicationAvailable = publicationAvailable;
         *rollbackVulkanQueue = vulkanQueue;
         *rollbackVulkanGeneration = vulkanGeneration;
-        return true;
+        if (telemetryMetadata) {
+            telemetryMetadata->accountingEpoch = submit.accountingEpoch;
+            telemetryMetadata->simulationId = submit.simulationId;
+            telemetryMetadata->captureGeneration = submit.captureGeneration;
+            telemetryMetadata->queueRole = submit.telemetryQueueRole;
+            telemetryMetadata->publicationCpuTimestampNs = submit.publicationCpuTimestampNs;
+            telemetryMetadata->publicationAvailable = submit.telemetryPublicationAvailable;
+        }
+        return SubmitPublicationResult::Published;
     }
 
     bool SimulationLedger::ownsSubmit(const SubmitRecord& submit,
@@ -564,14 +577,34 @@ namespace pacer {
 
     SimulationProgress SimulationLedger::accountCompletion(SubmitRecord& submit,
             void* commandQueue, uint64_t commandGeneration, void* vulkanQueue,
-            uint64_t vulkanGeneration, uint64_t gpuTimestamp) {
+            uint64_t vulkanGeneration, uint64_t gpuTimestamp,
+            uint64_t gpuExecutionStart, bool gpuExecutionStartAvailable,
+            SubmitCompletionResult* result,
+            SubmitTelemetryMetadata* telemetryMetadata) {
         std::lock_guard<dxvk::mutex> lock(m_mutex);
-        if (!submit.published || submit.completionAccounted ||
-                submit.commandQueue != commandQueue ||
+        *result = SubmitCompletionResult::NotCaptured;
+        if (telemetryMetadata)
+            *telemetryMetadata = {};
+        if (!submit.published || submit.commandQueue != commandQueue ||
                 submit.commandGeneration != commandGeneration ||
                 submit.vulkanQueue != vulkanQueue ||
                 submit.vulkanGeneration != vulkanGeneration)
             return {};
+        if (submit.completionAccounted) {
+            *result = SubmitCompletionResult::Duplicate;
+            return {};
+        }
+        *result = SubmitCompletionResult::Accepted;
+        if (telemetryMetadata) {
+            telemetryMetadata->accountingEpoch = submit.accountingEpoch;
+            telemetryMetadata->simulationId = submit.simulationId;
+            telemetryMetadata->captureGeneration = submit.captureGeneration;
+            telemetryMetadata->queueRole = submit.telemetryQueueRole;
+            telemetryMetadata->publicationCpuTimestampNs = submit.publicationCpuTimestampNs;
+            telemetryMetadata->gpuExecutionStart = gpuExecutionStart;
+            telemetryMetadata->publicationAvailable = submit.telemetryPublicationAvailable;
+            telemetryMetadata->gpuExecutionStartAvailable = gpuExecutionStartAvailable;
+        }
         submit.completionAccounted = true;
         submit.gpuTimestamp = gpuTimestamp;
         if (!m_epochActive || submit.accountingEpoch != m_activeEpoch)
@@ -674,7 +707,8 @@ namespace pacer {
                 simulation->completedSubmits == simulation->publishedSubmits) {
             m_gpuWatermark++;
             progress.gpu.push_back({simulation->simulationId,
-                    simulation->gpuTimestamp});
+                    simulation->gpuTimestamp, simulation->publishedSubmits,
+                    simulation->completedSubmits});
         }
         cleanupLocked();
         return progress;
