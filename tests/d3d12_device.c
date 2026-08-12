@@ -21,6 +21,8 @@
 
 #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
 #include "d3d12_crosstest.h"
+#include "vkd3d_command_queue_vkd3d_ext.h"
+#include "vkd3d_test_hooks.h"
 
 void test_create_device(void)
 {
@@ -68,6 +70,34 @@ void test_create_device(void)
     ok(hr == E_INVALIDARG, "Got unexpected hr %#x.\n", (int)hr);
     hr = D3D12CreateDevice(NULL, ~0u, &IID_ID3D12Device, (void **)&device);
     ok(hr == E_INVALIDARG, "Got unexpected hr %#x.\n", (int)hr);
+}
+
+void test_pacer_device_creation_failure(void)
+{
+    ID3D12Device *device = NULL;
+    HRESULT hr;
+
+    if (!SetEnvironmentVariableA("VKD3D_TEST_FAIL_PACER_DEVICE_CREATION", "1"))
+    {
+        skip("Failed to enable the pacer device creation failure hook.\n");
+        return;
+    }
+
+    hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0,
+            &IID_ID3D12Device, (void **)&device);
+    SetEnvironmentVariableA("VKD3D_TEST_FAIL_PACER_DEVICE_CREATION", NULL);
+
+    ok(hr == E_FAIL, "Got unexpected hr %#x.\n", (int)hr);
+    ok(!device, "Device creation returned device %p after pacer initialization failed.\n", device);
+    if (device)
+        ID3D12Device_Release(device);
+
+    device = NULL;
+    hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0,
+            &IID_ID3D12Device, (void **)&device);
+    ok(hr == S_OK, "Device creation did not recover after the injected failure, hr %#x.\n", (int)hr);
+    if (device)
+        ID3D12Device_Release(device);
 }
 
 void test_node_count(void)
@@ -923,6 +953,613 @@ void test_create_command_queue(void)
 
     refcount = ID3D12Device_Release(device);
     ok(!refcount, "ID3D12Device has %u references left.\n", refcount);
+}
+
+struct execute_thread_data
+{
+    ID3D12CommandQueue *queue;
+    ID3D12GraphicsCommandList *list;
+    HANDLE finished_event;
+};
+
+static void execute_thread_main(void *userdata)
+{
+    struct execute_thread_data *data = userdata;
+
+    ID3D12CommandQueue_ExecuteCommandLists(data->queue, 1,
+            (ID3D12CommandList **)&data->list);
+    signal_event(data->finished_event);
+}
+
+struct execute_acquisition_hook_data
+{
+    HANDLE acquired_event;
+    HANDLE continue_event;
+    HANDLE s0_accounted_event;
+    HANDLE s1_accounted_event;
+    unsigned int acquisition_wait_result;
+    unsigned int accounted_submit_count;
+    bool pause_execute;
+};
+
+struct execute_acquisition_test_context
+{
+    struct execute_acquisition_hook_data hook;
+    struct execute_thread_data execute;
+};
+
+#define EXECUTE_REGRESSION_TIMEOUT_MS 30000
+
+static void execute_acquisition_hook(
+        enum vkd3d_test_queue_transition_hook_point point, void *userdata)
+{
+    struct execute_acquisition_hook_data *data = userdata;
+
+    if (point == VKD3D_TEST_QUEUE_TRANSITION_HOOK_EXECUTE_PREPARATION_BEGIN)
+    {
+        if (!data->pause_execute)
+            return;
+        signal_event(data->acquired_event);
+        data->acquisition_wait_result = wait_event(data->continue_event,
+                EXECUTE_REGRESSION_TIMEOUT_MS);
+    }
+    else if (point == VKD3D_TEST_QUEUE_TRANSITION_HOOK_PACER_GPU_COMPLETE)
+    {
+        if (!data->accounted_submit_count++)
+            signal_event(data->s0_accounted_event);
+        else if (data->accounted_submit_count == 2)
+            signal_event(data->s1_accounted_event);
+    }
+}
+
+void test_execute_capture_acquisition_boundary(void)
+{
+    struct vkd3d_test_capture_snapshot snapshot;
+    struct vkd3d_test_capture_control control;
+    struct vkd3d_test_queue_transition_hook hook;
+    struct execute_acquisition_test_context *context;
+    ID3D12GraphicsCommandList *list = NULL;
+    ID3D12CommandAllocator *allocator = NULL;
+    ID3D12CommandQueue *queue = NULL;
+    ID3D12Fence *completion_fence = NULL, *gate_fence = NULL;
+    ID3D12Device *device;
+    HANDLE execute_thread = NULL, completion_event = NULL;
+    bool hook_installed = false, execute_released = false, execute_finished = false;
+    unsigned int wait_result;
+    UINT snapshot_size;
+    HRESULT hr;
+
+    memset(&snapshot, 0, sizeof(snapshot));
+    memset(&control, 0, sizeof(control));
+    memset(&hook, 0, sizeof(hook));
+    context = calloc(1, sizeof(*context));
+    ok(!!context, "Failed to allocate acquisition-boundary test context.\n");
+    if (!context)
+        return;
+    context->hook.acquisition_wait_result = WAIT_TIMEOUT;
+
+    if (!(device = create_device()))
+    {
+        skip("Failed to create device.\n");
+        free(context);
+        return;
+    }
+    queue = create_command_queue(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            D3D12_COMMAND_QUEUE_PRIORITY_NORMAL);
+    if (!queue)
+        goto cleanup;
+    hr = ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &IID_ID3D12CommandAllocator, (void **)&allocator);
+    ok(hr == S_OK, "Failed to create acquisition-boundary allocator, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    hr = ID3D12Device_CreateCommandList(device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list);
+    ok(hr == S_OK, "Failed to create acquisition-boundary list, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    ID3D12GraphicsCommandList_Close(list);
+
+    hr = ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE,
+            &IID_ID3D12Fence, (void **)&completion_fence);
+    ok(hr == S_OK, "Failed to create completion fence, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    hr = ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE,
+            &IID_ID3D12Fence, (void **)&gate_fence);
+    ok(hr == S_OK, "Failed to create gate fence, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    completion_event = create_event();
+    context->hook.acquired_event = create_event();
+    context->hook.continue_event = create_event();
+    context->hook.s0_accounted_event = create_event();
+    context->hook.s1_accounted_event = create_event();
+    context->execute.finished_event = create_event();
+    if (!completion_event || !context->hook.acquired_event ||
+            !context->hook.continue_event || !context->hook.s0_accounted_event ||
+            !context->hook.s1_accounted_event || !context->execute.finished_event)
+        goto cleanup;
+
+    hook.callback = execute_acquisition_hook;
+    hook.userdata = &context->hook;
+    hr = ID3D12CommandQueue_SetPrivateData(queue,
+            &VKD3D_TEST_QUEUE_TRANSITION_HOOK_GUID, sizeof(hook), &hook);
+    ok(hr == S_OK, "Failed to install acquisition hook, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    hook_installed = true;
+
+    control.external_reflex_id = 0x2001;
+    control.action = VKD3D_TEST_CAPTURE_CONTROL_OPEN;
+    hr = ID3D12Device_SetPrivateData(device, &VKD3D_TEST_CAPTURE_CONTROL_GUID,
+            sizeof(control), &control);
+    ok(hr == S_OK, "Failed to open acquisition-boundary capture, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+
+    /* S0 establishes a completed submit in the still-open capture. */
+    ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&list);
+    hr = ID3D12CommandQueue_Signal(queue, completion_fence, 1);
+    ok(hr == S_OK, "Failed to enqueue S0 completion signal, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    hr = ID3D12Fence_SetEventOnCompletion(completion_fence, 1, completion_event);
+    ok(hr == S_OK, "Failed to arm S0 completion event, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    wait_result = wait_event(completion_event, EXECUTE_REGRESSION_TIMEOUT_MS);
+    ok(wait_result == WAIT_OBJECT_0, "S0 did not finish, result %#x.\n", wait_result);
+    if (wait_result != WAIT_OBJECT_0)
+        goto cleanup;
+    wait_result = wait_event(context->hook.s0_accounted_event,
+            EXECUTE_REGRESSION_TIMEOUT_MS);
+    ok(wait_result == WAIT_OBJECT_0,
+            "S0 pacer accounting did not complete, result %#x.\n", wait_result);
+    if (wait_result != WAIT_OBJECT_0)
+        goto cleanup;
+    snapshot_size = sizeof(snapshot);
+    hr = ID3D12Device_GetPrivateData(device, &VKD3D_TEST_CAPTURE_CONTROL_GUID,
+            &snapshot_size, &snapshot);
+    ok(hr == S_OK && snapshot_size == sizeof(snapshot),
+            "Failed to get the S0 capture snapshot, hr %#x, size %u.\n",
+            (int)hr, snapshot_size);
+    if (FAILED(hr) || snapshot_size != sizeof(snapshot))
+        goto cleanup;
+    ok(snapshot.published_submits == 1 && snapshot.completed_submits == 1,
+            "S0 was not published and completed before S1.\n");
+
+    /* Keep S1 incomplete after publication without interfering with its CPU
+     * acquisition/validation/FIFO path. The hook is anchored immediately
+     * before transfer flushing, so Present seals the capture if acquisition
+     * is ever moved below that preparation boundary. */
+    hr = ID3D12CommandQueue_Wait(queue, gate_fence, 1);
+    ok(hr == S_OK, "Failed to enqueue the S1 GPU gate, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+
+    context->hook.pause_execute = true;
+    context->execute.queue = queue;
+    context->execute.list = list;
+    execute_thread = create_thread(execute_thread_main, &context->execute);
+    ok(!!execute_thread, "Failed to create S1 Execute thread.\n");
+    if (!execute_thread)
+        goto cleanup;
+
+    wait_result = wait_event(context->hook.acquired_event,
+            EXECUTE_REGRESSION_TIMEOUT_MS);
+    ok(wait_result == WAIT_OBJECT_0,
+            "S1 did not pause before transfer flushing and submission preparation, result %#x.\n",
+            wait_result);
+    if (wait_result != WAIT_OBJECT_0)
+        goto cleanup;
+
+    control.action = VKD3D_TEST_CAPTURE_CONTROL_PRESENT;
+    hr = ID3D12Device_SetPrivateData(device, &VKD3D_TEST_CAPTURE_CONTROL_GUID,
+            sizeof(control), &control);
+    ok(hr == S_OK, "Present was not accepted while S1 was acquired, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    snapshot_size = sizeof(snapshot);
+    hr = ID3D12Device_GetPrivateData(device, &VKD3D_TEST_CAPTURE_CONTROL_GUID,
+            &snapshot_size, &snapshot);
+    ok(hr == S_OK && snapshot_size == sizeof(snapshot),
+            "Failed to get the paused S1 capture snapshot, hr %#x, size %u.\n",
+            (int)hr, snapshot_size);
+    if (FAILED(hr) || snapshot_size != sizeof(snapshot))
+        goto cleanup;
+    ok(snapshot.in_flight_publications == 1 &&
+            snapshot.submission_seal_requested && !snapshot.submissions_sealed &&
+            snapshot.published_submits == 1 && snapshot.completed_submits == 1 &&
+            snapshot.gpu_finished == 1,
+            "Capture ownership was not held at the Execute preparation boundary.\n");
+
+    signal_event(context->hook.continue_event);
+    execute_released = true;
+    wait_result = wait_event(context->execute.finished_event,
+            EXECUTE_REGRESSION_TIMEOUT_MS);
+    ok(wait_result == WAIT_OBJECT_0, "S1 Execute did not finish, result %#x.\n", wait_result);
+    if (wait_result != WAIT_OBJECT_0)
+        goto cleanup;
+    execute_finished = true;
+    ok(context->hook.acquisition_wait_result == WAIT_OBJECT_0,
+            "S1 acquisition hook was not resumed, result %#x.\n",
+            context->hook.acquisition_wait_result);
+    if (context->hook.acquisition_wait_result != WAIT_OBJECT_0)
+        goto cleanup;
+    ok(join_thread(execute_thread), "Failed to join S1 Execute thread.\n");
+    execute_thread = NULL;
+
+    snapshot_size = sizeof(snapshot);
+    hr = ID3D12Device_GetPrivateData(device, &VKD3D_TEST_CAPTURE_CONTROL_GUID,
+            &snapshot_size, &snapshot);
+    ok(hr == S_OK && snapshot_size == sizeof(snapshot),
+            "Failed to get the published S1 capture snapshot, hr %#x, size %u.\n",
+            (int)hr, snapshot_size);
+    if (FAILED(hr) || snapshot_size != sizeof(snapshot))
+        goto cleanup;
+    ok(snapshot.published_submits == 2 &&
+            snapshot.in_flight_publications == 0 && snapshot.submissions_sealed &&
+            snapshot.completed_submits == 1 && snapshot.gpu_finished == 1,
+            "S1 did not publish before the final lease sealed, or completed early.\n");
+
+    hr = ID3D12CommandQueue_Signal(queue, completion_fence, 2);
+    ok(hr == S_OK, "Failed to enqueue S1 completion signal, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    hr = ID3D12Fence_Signal(gate_fence, 1);
+    ok(hr == S_OK, "Failed to release the S1 GPU gate, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    hr = ID3D12Fence_SetEventOnCompletion(completion_fence, 2, completion_event);
+    ok(hr == S_OK, "Failed to arm S1 completion event, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    wait_result = wait_event(completion_event, EXECUTE_REGRESSION_TIMEOUT_MS);
+    ok(wait_result == WAIT_OBJECT_0, "S1 did not finish, result %#x.\n", wait_result);
+    if (wait_result != WAIT_OBJECT_0)
+        goto cleanup;
+    wait_result = wait_event(context->hook.s1_accounted_event,
+            EXECUTE_REGRESSION_TIMEOUT_MS);
+    ok(wait_result == WAIT_OBJECT_0,
+            "S1 pacer accounting did not complete, result %#x.\n", wait_result);
+    if (wait_result != WAIT_OBJECT_0)
+        goto cleanup;
+    snapshot_size = sizeof(snapshot);
+    hr = ID3D12Device_GetPrivateData(device, &VKD3D_TEST_CAPTURE_CONTROL_GUID,
+            &snapshot_size, &snapshot);
+    ok(hr == S_OK && snapshot_size == sizeof(snapshot),
+            "Failed to get the completed S1 capture snapshot, hr %#x, size %u.\n",
+            (int)hr, snapshot_size);
+    if (FAILED(hr) || snapshot_size != sizeof(snapshot))
+        goto cleanup;
+    ok(snapshot.completed_submits == 2 && snapshot.gpu_finished == 2,
+            "GPU progress did not advance exactly once after S1 completed.\n");
+
+cleanup:
+    if (execute_thread && !execute_released && context->hook.continue_event)
+        signal_event(context->hook.continue_event);
+    if (execute_thread)
+    {
+        if (!execute_finished && context->execute.finished_event)
+        {
+            wait_result = wait_event(context->execute.finished_event,
+                    EXECUTE_REGRESSION_TIMEOUT_MS);
+            ok(wait_result == WAIT_OBJECT_0,
+                    "S1 Execute did not stop during cleanup, result %#x.\n", wait_result);
+            execute_finished = wait_result == WAIT_OBJECT_0;
+        }
+        if (execute_finished)
+            join_thread(execute_thread);
+        else
+            /* The worker still owns the heap context and D3D objects. Keep
+             * them alive rather than turning a bounded failure into a UAF. */
+            return;
+    }
+    if (hook_installed && queue)
+        ID3D12CommandQueue_SetPrivateData(queue,
+                &VKD3D_TEST_QUEUE_TRANSITION_HOOK_GUID, 0, NULL);
+    if (context->execute.finished_event)
+        destroy_event(context->execute.finished_event);
+    if (context->hook.s1_accounted_event)
+        destroy_event(context->hook.s1_accounted_event);
+    if (context->hook.s0_accounted_event)
+        destroy_event(context->hook.s0_accounted_event);
+    if (context->hook.continue_event)
+        destroy_event(context->hook.continue_event);
+    if (context->hook.acquired_event)
+        destroy_event(context->hook.acquired_event);
+    if (completion_event)
+        destroy_event(completion_event);
+    if (gate_fence)
+        ID3D12Fence_Release(gate_fence);
+    if (completion_fence)
+        ID3D12Fence_Release(completion_fence);
+    if (list)
+        ID3D12GraphicsCommandList_Release(list);
+    if (allocator)
+        ID3D12CommandAllocator_Release(allocator);
+    if (queue)
+        ID3D12CommandQueue_Release(queue);
+    ID3D12Device_Release(device);
+    free(context);
+}
+
+struct transition_hook_reentrant_data
+{
+    struct vkd3d_test_queue_transition_hook hook;
+    ID3D12CommandQueue *queue;
+    HANDLE completed_event;
+    LONG attempted;
+    LONG callback_count;
+    HRESULT disarm_hr;
+    HRESULT rearm_hr;
+};
+
+static void transition_hook_reentrant_callback(
+        enum vkd3d_test_queue_transition_hook_point point, void *userdata)
+{
+    struct transition_hook_reentrant_data *data = userdata;
+
+    if (point != VKD3D_TEST_QUEUE_TRANSITION_HOOK_EXECUTE_CAPTURE_ACQUIRED ||
+            InterlockedCompareExchange(&data->attempted, 1, 0))
+        return;
+
+    InterlockedIncrement(&data->callback_count);
+    data->disarm_hr = ID3D12CommandQueue_SetPrivateData(data->queue,
+            &VKD3D_TEST_QUEUE_TRANSITION_HOOK_GUID, 0, NULL);
+    data->rearm_hr = ID3D12CommandQueue_SetPrivateData(data->queue,
+            &VKD3D_TEST_QUEUE_TRANSITION_HOOK_GUID,
+            sizeof(data->hook), &data->hook);
+    signal_event(data->completed_event);
+}
+
+struct transition_hook_lifetime_observer
+{
+    LONG callbacks;
+    LONG exits;
+};
+
+struct transition_hook_lifetime_data
+{
+    uint64_t magic;
+    struct transition_hook_lifetime_observer *observer;
+    HANDLE entered_event;
+    HANDLE release_event;
+    HANDLE exited_event;
+    unsigned int release_wait_result;
+};
+
+#define TRANSITION_HOOK_LIFETIME_MAGIC 0xd15a4c0de55afeull
+
+static void transition_hook_lifetime_callback(
+        enum vkd3d_test_queue_transition_hook_point point, void *userdata)
+{
+    struct transition_hook_lifetime_data *data = userdata;
+
+    if (point != VKD3D_TEST_QUEUE_TRANSITION_HOOK_EXECUTE_CAPTURE_ACQUIRED)
+        return;
+
+    ok(data->magic == TRANSITION_HOOK_LIFETIME_MAGIC,
+            "C hook callback entered with invalid userdata.\n");
+    InterlockedIncrement(&data->observer->callbacks);
+    signal_event(data->entered_event);
+    data->release_wait_result = wait_event(data->release_event,
+            EXECUTE_REGRESSION_TIMEOUT_MS);
+    ok(data->release_wait_result == WAIT_OBJECT_0,
+            "C hook callback was not explicitly released, result %#x.\n",
+            data->release_wait_result);
+    ok(data->magic == TRANSITION_HOOK_LIFETIME_MAGIC,
+            "C hook userdata lifetime ended before callback exit.\n");
+    InterlockedIncrement(&data->observer->exits);
+    signal_event(data->exited_event);
+}
+
+struct transition_hook_disarm_thread_data
+{
+    ID3D12CommandQueue *queue;
+    HANDLE finished_event;
+    HRESULT hr;
+};
+
+static void transition_hook_disarm_thread_main(void *userdata)
+{
+    struct transition_hook_disarm_thread_data *data = userdata;
+
+    data->hr = ID3D12CommandQueue_SetPrivateData(data->queue,
+            &VKD3D_TEST_QUEUE_TRANSITION_HOOK_GUID, 0, NULL);
+    signal_event(data->finished_event);
+}
+
+void test_queue_transition_hook_protocol(void)
+{
+    struct transition_hook_lifetime_observer observer = {0};
+    struct transition_hook_disarm_thread_data disarm_data = {0};
+    struct transition_hook_reentrant_data reentrant = {0};
+    struct transition_hook_lifetime_data *lifetime = NULL;
+    struct execute_thread_data execute_data = {0};
+    struct vkd3d_test_queue_transition_hook hook = {0};
+    ID3D12GraphicsCommandList *list = NULL;
+    ID3D12CommandAllocator *allocator = NULL;
+    ID3D12CommandQueue *queue = NULL;
+    ID3D12Device *device;
+    HANDLE execute_thread = NULL, disarm_thread = NULL;
+    unsigned int wait_result;
+    UINT drain_size = 0;
+    HRESULT hr;
+
+    if (!(device = create_device()))
+    {
+        skip("Failed to create device.\n");
+        return;
+    }
+    queue = create_command_queue(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            D3D12_COMMAND_QUEUE_PRIORITY_NORMAL);
+    if (!queue)
+        goto cleanup;
+    hr = ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &IID_ID3D12CommandAllocator, (void **)&allocator);
+    ok(hr == S_OK, "Failed to create transition-hook allocator, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    hr = ID3D12Device_CreateCommandList(device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list);
+    ok(hr == S_OK, "Failed to create transition-hook list, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    ID3D12GraphicsCommandList_Close(list);
+
+    reentrant.queue = queue;
+    reentrant.completed_event = create_event();
+    execute_data.finished_event = create_event();
+    reentrant.hook.callback = transition_hook_reentrant_callback;
+    reentrant.hook.userdata = &reentrant;
+    ok(!!reentrant.completed_event && !!execute_data.finished_event,
+            "Failed to create reentrant transition-hook events.\n");
+    if (!reentrant.completed_event || !execute_data.finished_event)
+        goto cleanup;
+    hr = ID3D12CommandQueue_SetPrivateData(queue,
+            &VKD3D_TEST_QUEUE_TRANSITION_HOOK_GUID,
+            sizeof(reentrant.hook), &reentrant.hook);
+    ok(hr == S_OK, "Failed to install reentrant transition hook, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+    execute_data.queue = queue;
+    execute_data.list = list;
+    execute_thread = create_thread(execute_thread_main, &execute_data);
+    ok(!!execute_thread, "Failed to create reentrant transition-hook thread.\n");
+    if (!execute_thread)
+        goto cleanup;
+    wait_result = wait_event(reentrant.completed_event, EXECUTE_REGRESSION_TIMEOUT_MS);
+    ok(wait_result == WAIT_OBJECT_0,
+            "Reentrant transition-hook mutation deadlocked, result %#x.\n", wait_result);
+    if (wait_result != WAIT_OBJECT_0)
+        return;
+    wait_result = wait_event(execute_data.finished_event, EXECUTE_REGRESSION_TIMEOUT_MS);
+    ok(wait_result == WAIT_OBJECT_0,
+            "Execute did not return after rejected reentrant mutation, result %#x.\n", wait_result);
+    if (wait_result != WAIT_OBJECT_0)
+        return;
+    ok(join_thread(execute_thread), "Failed to join reentrant transition-hook thread.\n");
+    execute_thread = NULL;
+    ok(reentrant.disarm_hr == E_UNEXPECTED && reentrant.rearm_hr == E_UNEXPECTED &&
+            reentrant.callback_count == 1,
+            "Reentrant hook mutation returned %#x/%#x with %ld callbacks.\n",
+            (int)reentrant.disarm_hr, (int)reentrant.rearm_hr,
+            reentrant.callback_count);
+    hr = ID3D12CommandQueue_SetPrivateData(queue,
+            &VKD3D_TEST_QUEUE_TRANSITION_HOOK_GUID, 0, NULL);
+    ok(hr == S_OK, "External disarm after reentrant rejection failed, hr %#x.\n", (int)hr);
+    destroy_event(execute_data.finished_event);
+    execute_data.finished_event = NULL;
+    destroy_event(reentrant.completed_event);
+    reentrant.completed_event = NULL;
+
+    lifetime = calloc(1, sizeof(*lifetime));
+    ok(!!lifetime, "Failed to allocate C transition-hook userdata.\n");
+    if (!lifetime)
+        goto cleanup;
+    lifetime->magic = TRANSITION_HOOK_LIFETIME_MAGIC;
+    lifetime->observer = &observer;
+    lifetime->entered_event = create_event();
+    lifetime->release_event = create_event();
+    lifetime->exited_event = create_event();
+    execute_data.finished_event = create_event();
+    disarm_data.finished_event = create_event();
+    ok(!!lifetime->entered_event && !!lifetime->release_event &&
+            !!lifetime->exited_event && !!execute_data.finished_event &&
+            !!disarm_data.finished_event,
+            "Failed to create C transition-hook lifetime events.\n");
+    if (!lifetime->entered_event || !lifetime->release_event ||
+            !lifetime->exited_event || !execute_data.finished_event ||
+            !disarm_data.finished_event)
+        goto cleanup;
+    hook.callback = transition_hook_lifetime_callback;
+    hook.userdata = lifetime;
+    hr = ID3D12CommandQueue_SetPrivateData(queue,
+            &VKD3D_TEST_QUEUE_TRANSITION_HOOK_GUID, sizeof(hook), &hook);
+    ok(hr == S_OK, "Failed to install C lifetime hook, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+
+    execute_thread = create_thread(execute_thread_main, &execute_data);
+    ok(!!execute_thread, "Failed to create C lifetime Execute thread.\n");
+    if (!execute_thread)
+        goto cleanup;
+    wait_result = wait_event(lifetime->entered_event, EXECUTE_REGRESSION_TIMEOUT_MS);
+    ok(wait_result == WAIT_OBJECT_0,
+            "C lifetime hook did not acquire ownership, result %#x.\n", wait_result);
+    if (wait_result != WAIT_OBJECT_0)
+        return;
+    disarm_data.queue = queue;
+    disarm_thread = create_thread(transition_hook_disarm_thread_main, &disarm_data);
+    ok(!!disarm_thread, "Failed to create C transition-hook disarm thread.\n");
+    if (!disarm_thread)
+        goto cleanup;
+
+    hr = ID3D12CommandQueue_GetPrivateData(queue,
+            &VKD3D_TEST_QUEUE_TRANSITION_HOOK_DRAIN_GUID, &drain_size, NULL);
+    ok(hr == S_OK, "Failed to observe C hook revoke/drain phase, hr %#x.\n", (int)hr);
+    wait_result = wait_event(disarm_data.finished_event, 0);
+    ok(wait_result == WAIT_TIMEOUT,
+            "C hook disarm returned while its callback was paused, result %#x.\n", wait_result);
+    signal_event(lifetime->release_event);
+    wait_result = wait_event(lifetime->exited_event, EXECUTE_REGRESSION_TIMEOUT_MS);
+    ok(wait_result == WAIT_OBJECT_0,
+            "C lifetime callback did not exit, result %#x.\n", wait_result);
+    wait_result = wait_event(disarm_data.finished_event, EXECUTE_REGRESSION_TIMEOUT_MS);
+    ok(wait_result == WAIT_OBJECT_0 && disarm_data.hr == S_OK,
+            "C hook disarm did not return after callback exit, result %#x, hr %#x.\n",
+            wait_result, (int)disarm_data.hr);
+
+    destroy_event(lifetime->exited_event);
+    destroy_event(lifetime->release_event);
+    destroy_event(lifetime->entered_event);
+    lifetime->magic = 0;
+    free(lifetime);
+    lifetime = NULL;
+    ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&list);
+    ok(observer.callbacks == 1 && observer.exits == 1,
+            "C hook touched destroyed userdata after disarm (%ld/%ld).\n",
+            observer.callbacks, observer.exits);
+    ok(join_thread(execute_thread), "Failed to join C lifetime Execute thread.\n");
+    execute_thread = NULL;
+    ok(join_thread(disarm_thread), "Failed to join C hook disarm thread.\n");
+    disarm_thread = NULL;
+
+cleanup:
+    if (lifetime && lifetime->release_event)
+        signal_event(lifetime->release_event);
+    if (execute_thread)
+        join_thread(execute_thread);
+    if (disarm_thread)
+        join_thread(disarm_thread);
+    if (lifetime)
+    {
+        if (lifetime->exited_event)
+            destroy_event(lifetime->exited_event);
+        if (lifetime->release_event)
+            destroy_event(lifetime->release_event);
+        if (lifetime->entered_event)
+            destroy_event(lifetime->entered_event);
+        free(lifetime);
+    }
+    if (disarm_data.finished_event)
+        destroy_event(disarm_data.finished_event);
+    if (execute_data.finished_event)
+        destroy_event(execute_data.finished_event);
+    if (reentrant.completed_event)
+        destroy_event(reentrant.completed_event);
+    if (queue)
+        ID3D12CommandQueue_SetPrivateData(queue,
+                &VKD3D_TEST_QUEUE_TRANSITION_HOOK_GUID, 0, NULL);
+    if (list)
+        ID3D12GraphicsCommandList_Release(list);
+    if (allocator)
+        ID3D12CommandAllocator_Release(allocator);
+    if (queue)
+        ID3D12CommandQueue_Release(queue);
+    ID3D12Device_Release(device);
 }
 
 void test_create_command_signature(void)

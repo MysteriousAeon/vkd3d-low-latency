@@ -30,6 +30,7 @@ decl_test(test_device_factory_create_device);
 decl_test(test_device_configuration);
 
 decl_test(test_create_device);
+decl_test(test_pacer_device_creation_failure);
 decl_test(test_node_count);
 decl_test(test_check_feature_support);
 decl_test(test_format_support);
@@ -37,6 +38,8 @@ decl_test(test_multisample_quality_levels);
 decl_test(test_create_command_allocator);
 decl_test(test_create_command_list);
 decl_test(test_create_command_queue);
+decl_test(test_queue_transition_hook_protocol);
+decl_test(test_execute_capture_acquisition_boundary);
 decl_test(test_create_command_signature);
 decl_test(test_create_committed_resource);
 decl_test(test_create_heap);

@@ -1,5 +1,5 @@
 
-vkd3d_test_flags = []
+vkd3d_test_flags = ['-DVKD3D_ENABLE_TEST_HOOKS']
 vkd3d_test_deps = [ lib_d3d12, vkd3d_common_dep ]
 if vkd3d_platform == 'windows'
   vkd3d_test_deps += [ lib_dxgi ]
@@ -66,3 +66,12 @@ executable('pso-library-bloat', 'pso_library_bloat.c',
   install             : false,
   c_args              : vkd3d_test_flags,
   link_with           : [ d3d12_test_utils_lib ])
+
+framepacer_accounting_test = executable('framepacer-accounting',
+  'framepacer_accounting.cpp',
+  dependencies        : [ vkd3d_dep, vkd3d_common_dep ],
+  include_directories : [ vkd3d_private_includes, include_directories('../libs/vkd3d') ],
+  install             : false,
+  cpp_args            : vkd3d_test_flags)
+
+test('framepacer-accounting', framepacer_accounting_test)
