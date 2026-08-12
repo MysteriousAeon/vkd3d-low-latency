@@ -122,7 +122,7 @@ struct vkd3d_test_capture_snapshot
     uint32_t active_lease_count;
     uint32_t capture_record_count;
     uint32_t end_association_count;
-    uint32_t end_association_budget;
+    uint64_t highest_started_external_id;
     uint32_t published_submits;
     uint32_t accounted_submits;
     uint32_t completed_submits;
@@ -131,7 +131,6 @@ struct vkd3d_test_capture_snapshot
     bool submissions_sealed;
     bool cpu_sealed;
     bool tracking_failed;
-    bool capture_tracking_exhausted;
     uint64_t cpu_finished;
     uint64_t gpu_finished;
 };

@@ -519,7 +519,7 @@ void pacer_test_get_capture_snapshot(void *device, uint64_t capture_generation,
     snapshot->active_lease_count = source.activeLeaseCount;
     snapshot->capture_record_count = source.captureRecordCount;
     snapshot->end_association_count = source.endAssociationCount;
-    snapshot->end_association_budget = source.endAssociationBudget;
+    snapshot->highest_started_external_id = source.highestStartedExternalId;
     snapshot->published_submits = source.publishedSubmits;
     snapshot->accounted_submits = source.accountedSubmits;
     snapshot->completed_submits = source.completedSubmits;
@@ -528,7 +528,6 @@ void pacer_test_get_capture_snapshot(void *device, uint64_t capture_generation,
     snapshot->submissions_sealed = source.submissionsSealed;
     snapshot->cpu_sealed = source.cpuSealed;
     snapshot->tracking_failed = source.trackingFailed;
-    snapshot->capture_tracking_exhausted = source.captureTrackingExhausted;
     snapshot->cpu_finished = DEVICE(device)->m_pacer->m_frameSync.cpuFinished.load();
     snapshot->gpu_finished = DEVICE(device)->m_pacer->m_frameSync.gpuFinished.load();
 }

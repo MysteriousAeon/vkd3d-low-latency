@@ -177,8 +177,7 @@ namespace pacer {
         uint32_t activeLeaseCount = 0;
         uint32_t captureRecordCount = 0;
         uint32_t endAssociationCount = 0;
-        uint32_t endAssociationBudget = 0;
-        bool captureTrackingExhausted = false;
+        uint64_t highestStartedExternalId = 0;
     };
 #endif
 
@@ -246,7 +245,6 @@ namespace pacer {
 
     private:
         static constexpr size_t MaxRetainedTerminalCaptures = 64;
-        static constexpr size_t MaxEndAssociationsPerEpoch = 4096;
         enum class EndAssociationState : uint32_t { AwaitingEnd, Consumed };
         struct EndAssociation {
             uint64_t accountingEpoch = 0;
@@ -290,8 +288,8 @@ namespace pacer {
         uint64_t m_nextPublicationLeaseId = 1;
         uint64_t m_nextPresentAttemptGeneration = 1;
         uint64_t m_activeEpoch = 0;
+        uint64_t m_highestStartedExternalId = 0;
         bool m_epochActive = false;
-        bool m_captureTrackingExhausted = false;
         std::atomic<bool> m_bypassPacing = { false };
     };
 

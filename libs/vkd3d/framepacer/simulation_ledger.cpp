@@ -27,8 +27,8 @@ namespace pacer {
         m_cpuWatermark = firstSimulationId - 1;
         m_gpuWatermark = firstSimulationId - 1;
         m_activeEpoch = accountingEpoch;
+        m_highestStartedExternalId = 0;
         m_epochActive = true;
-        m_captureTrackingExhausted = false;
         m_bypassPacing.store(false, std::memory_order_release);
     }
 
@@ -52,8 +52,8 @@ namespace pacer {
         m_endAssociations.clear();
         m_externalMappings.clear();
         m_threadOwnership.clear();
+        m_highestStartedExternalId = 0;
         m_epochActive = false;
-        m_captureTrackingExhausted = false;
         m_bypassPacing.store(true, std::memory_order_release);
     }
 
@@ -135,28 +135,17 @@ namespace pacer {
         std::lock_guard<dxvk::mutex> lock(m_mutex);
         if (!m_epochActive || accountingEpoch != m_activeEpoch)
             return;
-        if (m_captureTrackingExhausted) {
-            markUntrustedFrontierLocked(CaptureFailureReason::InvalidStart);
-            return;
-        }
         if (!externalReflexId) {
             markUntrustedFrontierLocked(CaptureFailureReason::InvalidStart);
             return;
         }
 
-        /* A same-epoch external ID is single-use for render START/END. Keeping
-         * consumed associations as tombstones prevents a delayed duplicate END
-         * from ever closing a capture created after ID reuse. */
-        if (m_endAssociations.find(externalReflexId) != m_endAssociations.end()) {
+        /* Frame marker IDs are device-level monotonic and each render START ID
+         * is single-use within an accounting epoch. The high-watermark is the
+         * permanent replay guard; heavyweight associations are only needed
+         * while exact capture ownership can still be affected. */
+        if (externalReflexId <= m_highestStartedExternalId) {
             markUntrustedFrontierLocked(CaptureFailureReason::DuplicateStart);
-            return;
-        }
-        if (m_endAssociations.size() >= MaxEndAssociationsPerEpoch) {
-            /* Same-epoch END associations are replay guards and cannot be
-             * discarded safely. Stop trusting new captures at the finite
-             * budget instead of reusing an ID or growing without bound. */
-            m_captureTrackingExhausted = true;
-            markUntrustedFrontierLocked(CaptureFailureReason::InvalidStart);
             return;
         }
         auto mapping = m_externalMappings.find(externalReflexId);
@@ -175,6 +164,7 @@ namespace pacer {
         capture.simulationId = simulation->simulationId;
         capture.externalReflexId = externalReflexId;
         capture.originatingThreadId = threadId;
+        m_highestStartedExternalId = externalReflexId;
         m_openCaptures.insert(generation);
         m_endAssociations.emplace(externalReflexId, EndAssociation{
                 accountingEpoch, generation, simulation->simulationId,
@@ -193,6 +183,9 @@ namespace pacer {
         auto association = m_endAssociations.find(externalReflexId);
         if (association == m_endAssociations.end() ||
                 association->second.accountingEpoch != accountingEpoch) {
+            if (externalReflexId &&
+                    externalReflexId <= m_highestStartedExternalId)
+                return collectProgressLocked();
             markUntrustedFrontierLocked(CaptureFailureReason::InvalidEnd);
             return collectProgressLocked();
         }
@@ -210,9 +203,9 @@ namespace pacer {
             return collectProgressLocked();
         }
 
-        /* Present can close and retire the exact capture before its END marker.
-         * The immutable association remains sufficient after heavyweight
-         * capture reclamation to identify that marker unambiguously. */
+        /* Present can close the exact capture before its END marker. Preserve
+         * the association while publication leases keep ownership live; after
+         * terminal reclamation the high-watermark handles the delayed END. */
         if (!capture || capture->state == CaptureState::Closing ||
                 capture->state == CaptureState::Retired) {
             association->second.state = EndAssociationState::Consumed;
@@ -335,6 +328,7 @@ namespace pacer {
             if (simulation)
                 finalizeSubmissionSealLocked(*simulation, capture);
         }
+        cleanupLocked();
         return accepted;
     }
 
@@ -689,6 +683,21 @@ namespace pacer {
     void SimulationLedger::cleanupLocked() {
         size_t retainedTerminalCaptures = 0;
 
+        /* Once a capture is terminal and its final publication lease has
+         * retired, a later exact or duplicate END cannot affect ownership.
+         * The monotonic START high-watermark then classifies it as historical. */
+        for (auto entry = m_endAssociations.begin();
+                entry != m_endAssociations.end(); ) {
+            CaptureRecord* capture = findCaptureLocked(
+                    entry->second.captureGeneration);
+            if (capture && !capture->inFlightPublications &&
+                    (capture->state == CaptureState::Retired ||
+                     capture->state == CaptureState::Failed))
+                entry = m_endAssociations.erase(entry);
+            else
+                ++entry;
+        }
+
         /* Submit completion is keyed entirely by the immutable SubmitRecord;
          * after the final publication lease retires, it no longer consults the
          * CaptureRecord. Keep only a small diagnostic tail of terminal records.
@@ -790,8 +799,7 @@ namespace pacer {
         snapshot.activeLeaseCount = m_activePublicationLeases.size();
         snapshot.captureRecordCount = m_captures.size();
         snapshot.endAssociationCount = m_endAssociations.size();
-        snapshot.endAssociationBudget = MaxEndAssociationsPerEpoch;
-        snapshot.captureTrackingExhausted = m_captureTrackingExhausted;
+        snapshot.highestStartedExternalId = m_highestStartedExternalId;
         if (capture == m_captures.end())
             return snapshot;
         const CaptureRecord& record = capture->second;

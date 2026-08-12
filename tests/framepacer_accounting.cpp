@@ -1225,16 +1225,19 @@ static void run_capture_close_then_publish_case()
             pacer_command_queue_acquire_capture(f.queues.command_queue);
     NvAPI_setLatencyMarker(f.device, 101,
             VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
+    NvAPI_setLatencyMarker(f.device, 101,
+            VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
     vkd3d_test_capture_snapshot closing = capture_snapshot(f);
     check(lease.active && closing.in_flight_publications == 1 &&
+            closing.end_association_count == 1 &&
             closing.submission_seal_requested && !closing.submissions_sealed,
-            "capture-2: END sealed while its pre-close lease was outstanding.\n");
+            "capture-2: duplicate END or pre-close lease corrupted exact ownership.\n");
 
     fixture::submit_pair submit = commit_capture_lease(f, &lease);
     vkd3d_test_capture_snapshot sealed = capture_snapshot(f);
     check(submit.command && sealed.published_submits == 1 &&
             sealed.in_flight_publications == 0 && sealed.submissions_sealed &&
-            !sealed.tracking_failed,
+            sealed.end_association_count == 0 && !sealed.tracking_failed,
             "capture-2: pre-close lease did not publish after END.\n");
     std::printf("capture-2: lease acquired before END published after closure.\n");
 }
@@ -1349,7 +1352,7 @@ static void run_capture_external_reuse_case()
     check(first.command && state.capture_generation == first_generation &&
             state.open_capture_count == 0 && state.tracking_failed,
             "capture-8: reused external ID allowed delayed END to close a newer capture.\n");
-    std::printf("capture-8: external-ID reuse retained its END tombstone.\n");
+    std::printf("capture-8: external-ID reuse was rejected by the high-watermark.\n");
 }
 
 static void run_capture_invalid_markers_case()
@@ -1417,62 +1420,88 @@ static void run_capture_end_after_present_case()
     std::printf("capture-12: exact END after Present was consumed idempotently.\n");
 }
 
-static void run_capture_bounded_retention_case()
+static void run_capture_long_session_case()
 {
     static constexpr uint64_t first_external_id = 10000;
+    static constexpr uint32_t capture_count = 100000;
     fixture f(false, false);
     vkd3d_test_capture_snapshot state = {};
-    uint32_t budget;
 
     f.enable_reflex(first_external_id);
-    budget = capture_snapshot(f).end_association_budget;
-    check(budget > 64, "capture-13: invalid END association budget %u.\n", budget);
 
-    for (uint32_t i = 0; i < budget; i++)
+    for (uint32_t i = 0; i < capture_count; i++)
     {
         uint64_t external_id = first_external_id + i;
-        if (i)
-            f.begin_simulation(external_id);
         fixture::submit_pair submit = f.submit();
-        if (i)
-            NvAPI_setLatencyMarker(f.device, external_id,
-                    VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
+        NvAPI_setLatencyMarker(f.device, external_id,
+                VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
         f.present(external_id);
         if (submit.command)
             f.complete_gpu(submit.command, submit.vulkan);
-        if (i == 128)
+        if (i + 1 < capture_count)
         {
-            NvAPI_setLatencyMarker(f.device, first_external_id,
-                    VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
-            check(!f.snapshot(0, 0).tracking_bypassed,
-                    "capture-13: delayed exact END after reclamation poisoned tracking.\n");
+            f.begin_simulation(external_id + 1);
+            if (i == 128)
+            {
+                NvAPI_setLatencyMarker(f.device, first_external_id,
+                        VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
+                state = capture_snapshot(f);
+                check(state.open_capture_count == 1 &&
+                        !f.snapshot(0, 0).tracking_bypassed,
+                        "capture-13: delayed old END affected a newer open capture.\n");
+            }
         }
     }
 
     state = capture_snapshot(f);
     check(state.capture_record_count <= 64 &&
-            state.end_association_count == budget &&
-            !state.capture_tracking_exhausted,
-            "capture-13: retention was not bounded before exhaustion (%u captures, %u/%u associations).\n",
-            state.capture_record_count, state.end_association_count, budget);
+            state.end_association_count == 0 &&
+            state.highest_started_external_id ==
+                    first_external_id + capture_count - 1 &&
+            !f.snapshot(0, 0).tracking_bypassed,
+            "capture-13: 100k session was unbounded or bypassed (%u captures, %u associations).\n",
+            state.capture_record_count, state.end_association_count);
+    std::printf("capture-13: 100000 same-epoch captures stayed bounded and trusted.\n");
+}
 
-    f.begin_simulation(first_external_id + budget);
-    vkd3d_test_capture_snapshot exhausted = capture_snapshot(f);
-    check(exhausted.capture_record_count <= 64 &&
-            exhausted.end_association_count == budget &&
-            exhausted.capture_tracking_exhausted &&
-            f.snapshot(0, 0).tracking_bypassed,
-            "capture-13: budget exhaustion allocated or failed to bypass conservatively.\n");
+static void run_capture_marker_order_cases()
+{
+    {
+        fixture f(true, false);
+        f.begin_simulation(100);
+        vkd3d_test_capture_snapshot state = capture_snapshot(f);
+        check(state.open_capture_count == 0 &&
+                state.highest_started_external_id == 101 &&
+                f.snapshot(0, 0).tracking_bypassed,
+                "capture-14: non-monotonic START was accepted.\n");
+    }
 
-    NvAPI_setLatencyMarker(f.device, first_external_id,
-            VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
-    f.begin_simulation(first_external_id);
-    vkd3d_test_capture_snapshot replay = capture_snapshot(f);
-    check(replay.open_capture_count == 0 &&
-            replay.end_association_count == budget &&
-            replay.capture_record_count <= 64,
-            "capture-13: delayed END or reused START escaped bounded replay protection.\n");
-    std::printf("capture-13: heavyweight retention and END replay guards stayed bounded.\n");
+    {
+        fixture f(true, false);
+        NvAPI_setLatencyMarker(f.device, 102,
+                VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
+        check(f.snapshot(0, 0).tracking_bypassed,
+                "capture-14: future END did not fail conservatively.\n");
+    }
+
+    {
+        fixture f(true, false);
+        fixture::submit_pair submit = f.submit();
+        NvAPI_setLatencyMarker(f.device, 101,
+                VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
+        f.present();
+        if (submit.command)
+            f.complete_gpu(submit.command, submit.vulkan);
+        f.disable_reflex();
+        f.enable_reflex(101);
+        vkd3d_test_capture_snapshot reset = capture_snapshot(f);
+        check(reset.open_capture_count == 1 &&
+                reset.highest_started_external_id == 101 &&
+                !f.snapshot(0, 0).tracking_bypassed,
+                "capture-14: accounting epoch transition did not permit ID reset.\n");
+    }
+
+    std::printf("capture-14: marker ordering, future END, and epoch reset validated.\n");
 }
 
 struct command_ring_barrier
@@ -2424,7 +2453,8 @@ int main()
     run_capture_historical_thread_case();
     run_capture_external_metadata_identity_case();
     run_capture_end_after_present_case();
-    run_capture_bounded_retention_case();
+    run_capture_long_session_case();
+    run_capture_marker_order_cases();
     run_command_ring_legacy_publication_cases();
     run_command_ring_captured_rollback_cases();
     run_post_command_reclaim_failure_case();
