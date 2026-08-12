@@ -1127,20 +1127,25 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
     struct dxgi_vk_swap_chain_present_request *request;
     struct vkd3d_queue_timeline_trace_cookie cookie;
+    struct pacer_present_attempt_token pacer_attempt;
     bool low_latency_enable;
 
     TRACE("iface %p, SyncInterval %u, PresentFlags #%x, pPresentParameters %p.\n",
             iface, SyncInterval, PresentFlags, pPresentParameters);
     (void)pPresentParameters;
 
+    pacer_attempt = pacer_begin_present_attempt(chain->queue->device->pacer_device);
+
     if (dxgi_vk_swap_chain_present_is_occluded(chain))
     {
-        pacer_notify_aborted_present(chain->queue->device->pacer_device, chain);
+        pacer_notify_aborted_present(chain->queue->device->pacer_device, chain,
+                pacer_attempt);
         return DXGI_STATUS_OCCLUDED;
     }
     if (PresentFlags & DXGI_PRESENT_TEST)
     {
-        pacer_notify_aborted_present(chain->queue->device->pacer_device, chain);
+        pacer_notify_aborted_present(chain->queue->device->pacer_device, chain,
+                pacer_attempt);
         return S_OK;
     }
 
@@ -1150,7 +1155,8 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
     chain->user.present_count += 1;
     request = &chain->request_ring[chain->user.present_count % ARRAY_SIZE(chain->request_ring)];
 
-    request->pacer_frame_id = pacer_notify_present(chain->queue->device->pacer_device, chain);
+    request->pacer_frame_id = pacer_notify_present(chain->queue->device->pacer_device,
+            chain, chain->user.present_count, pacer_attempt);
     request->swap_interval = SyncInterval;
     request->dxgi_format = chain->user.backbuffers[chain->user.index]->desc.Format;
     request->user_index = chain->user.index;

@@ -22,7 +22,8 @@ namespace pacer {
 
     ~MinLatencyMode() {}
 
-    void startFrame( uint64_t frameId, dxvk::high_resolution_clock::time_point ) override {
+    void startFrame(uint64_t, uint64_t frameId,
+            dxvk::high_resolution_clock::time_point) override {
 
       dxvk::Sleep::TimePoint now = dxvk::high_resolution_clock::now();
       int32_t frametime = std::chrono::duration_cast<std::chrono::microseconds>(

@@ -76,6 +76,42 @@ namespace pacer {
             return cur >= value;
         }
 
+        bool wait( uint64_t value, DWORD timeout,
+                const std::atomic<uint64_t>& generation,
+                uint64_t expectedGeneration ) {
+            using time_point = std::chrono::steady_clock::time_point;
+            using namespace std::chrono;
+
+            uint64_t cur = m_value.load(std::memory_order_acquire);
+            if (generation.load(std::memory_order_acquire) != expectedGeneration)
+                return false;
+            if (cur >= value)
+                return true;
+
+            time_point t = steady_clock::now();
+            time_point target = t + milliseconds(timeout);
+
+            while (cur < value && t < target) {
+                DWORD remaining = duration_cast<milliseconds>(target-t).count();
+                /* The generation lives at a different address, so its wake can
+                 * race the interval between checking it and entering this wait.
+                 * Bound each wait to make that race self-healing. */
+                DWORD waitDuration = remaining > 5 ? 5 : remaining;
+                WaitOnAddress(&m_value, &cur, sizeof(uint64_t), waitDuration);
+                if (generation.load(std::memory_order_acquire) != expectedGeneration)
+                    return false;
+                cur = m_value.load(std::memory_order_acquire);
+                t = steady_clock::now();
+            }
+
+            return generation.load(std::memory_order_acquire) == expectedGeneration &&
+                    cur >= value;
+        }
+
+        void wake() {
+            WakeByAddressAll(&m_value);
+        }
+
         private:
 
             std::atomic<uint64_t> m_value;

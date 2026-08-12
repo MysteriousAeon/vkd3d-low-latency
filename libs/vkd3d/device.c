@@ -4853,6 +4853,26 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_GetPrivateData(d3d12_device_iface 
     TRACE("iface %p, guid %s, data_size %p, data %p.\n",
             iface, debugstr_guid(guid), data_size, data);
 
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    if (IsEqualGUID(guid, &VKD3D_TEST_CAPTURE_CONTROL_GUID))
+    {
+        struct vkd3d_test_capture_snapshot snapshot;
+
+        if (!data_size)
+            return E_INVALIDARG;
+        if (!data || *data_size < sizeof(snapshot))
+        {
+            *data_size = sizeof(snapshot);
+            return data ? DXGI_ERROR_MORE_DATA : S_OK;
+        }
+        memset(&snapshot, 0, sizeof(snapshot));
+        pacer_test_get_capture_snapshot(device->pacer_device, 0, &snapshot);
+        memcpy(data, &snapshot, sizeof(snapshot));
+        *data_size = sizeof(snapshot);
+        return S_OK;
+    }
+#endif
+
     return vkd3d_get_private_data(&device->private_store, guid, data_size, data);
 }
 
@@ -4863,6 +4883,40 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_SetPrivateData(d3d12_device_iface 
 
     TRACE("iface %p, guid %s, data_size %u, data %p.\n",
             iface, debugstr_guid(guid), data_size, data);
+
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    if (IsEqualGUID(guid, &VKD3D_TEST_CAPTURE_CONTROL_GUID))
+    {
+        const struct vkd3d_test_capture_control *control = data;
+
+        if (!control || data_size != sizeof(*control) ||
+                !control->external_reflex_id)
+            return E_INVALIDARG;
+        switch (control->action)
+        {
+            case VKD3D_TEST_CAPTURE_CONTROL_OPEN:
+                NvAPI_setSleepMode(device->pacer_device, true, 0);
+                NvAPI_sleep(device->pacer_device);
+                NvAPI_setLatencyMarker(device->pacer_device,
+                        control->external_reflex_id,
+                        VK_LATENCY_MARKER_SIMULATION_START_NV);
+                NvAPI_setLatencyMarker(device->pacer_device,
+                        control->external_reflex_id,
+                        VK_LATENCY_MARKER_RENDERSUBMIT_START_NV);
+                return S_OK;
+            case VKD3D_TEST_CAPTURE_CONTROL_PRESENT:
+                return pacer_test_accept_present(device->pacer_device,
+                        control->external_reflex_id) ? S_OK : E_FAIL;
+            case VKD3D_TEST_CAPTURE_CONTROL_END:
+                NvAPI_setLatencyMarker(device->pacer_device,
+                        control->external_reflex_id,
+                        VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
+                return S_OK;
+            default:
+                return E_INVALIDARG;
+        }
+    }
+#endif
 
     return vkd3d_set_private_data(&device->private_store, guid, data_size, data,
             (vkd3d_set_name_callback) d3d12_device_set_name, device);
@@ -11526,6 +11580,12 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
         = device->vk_procs.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR;
 
     device->pacer_device = pacer_create_device(&pacer_device_properties, &pacer_device_vk_procs);
+    if (!device->pacer_device)
+    {
+        ERR("Failed to initialize frame-pacer device.\n");
+        hr = E_FAIL;
+        goto out_cleanup_address_binding_tracker;
+    }
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     vkd3d_breadcrumb_tracer_init_barrier_hashes(&device->breadcrumb_tracer);
@@ -11590,8 +11650,8 @@ out_cleanup_breadcrumb_tracer:
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS))
         vkd3d_breadcrumb_tracer_cleanup(&device->breadcrumb_tracer, device);
-out_cleanup_address_binding_tracker:
 #endif
+out_cleanup_address_binding_tracker:
     vkd3d_address_binding_tracker_cleanup(&device->address_binding_tracker, device);
 out_cleanup_queue_timeline_trace:
     vkd3d_queue_timeline_trace_cleanup(&device->queue_timeline_trace);
@@ -11622,6 +11682,8 @@ out_free_private_store:
     vkd3d_private_store_destroy(&device->private_store);
 out_free_vk_resources:
     d3d12_device_destroy_vkd3d_queues(device);
+    d3d12_device_cleanup_vendor_hacks(device);
+    vkd3d_free((void *)device->vk_info.extension_names);
     vk_procs = &device->vk_procs;
     VK_CALL(vkDestroyDevice(device->vk_device, NULL));
 out_free_instance:

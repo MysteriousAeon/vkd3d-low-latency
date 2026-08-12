@@ -70,7 +70,8 @@ namespace pacer {
 
         ~LowLatencyMode() {}
 
-        void startFrame( uint64_t frameId, time_point lastStart ) override {
+        void startFrame(uint64_t generation, uint64_t frameId,
+                time_point lastStart) override {
 
             using std::chrono::duration_cast;
 
@@ -81,9 +82,12 @@ namespace pacer {
             InFlight inFlight;
             inFlight.numInFlight = frameId - gpuFinishedId;
             inFlight.earliestFrameId = gpuFinishedId+1;
-            inFlight.m = m_latencyMarkers->getConstMarkers(frameId-1);
-            inFlight.m_prev = m_latencyMarkers->getConstMarkers(frameId-2);
-            inFlight.m_prev_prev = m_latencyMarkers->getConstMarkers(frameId-3);
+            LatencyMarkers markers = m_latencyMarkers->getMarkers(generation, frameId-1);
+            LatencyMarkers markersPrev = m_latencyMarkers->getMarkers(generation, frameId-2);
+            LatencyMarkers markersPrevPrev = m_latencyMarkers->getMarkers(generation, frameId-3);
+            inFlight.m = &markers;
+            inFlight.m_prev = &markersPrev;
+            inFlight.m_prev_prev = &markersPrevPrev;
 
             _INFO( "num inflight frames : %" PRIu16 " \n", inFlight.numInFlight );
 
@@ -121,15 +125,17 @@ namespace pacer {
 //          { m_gpuProgress.notifyQueueSubmit( frameId, t ); }
 
 
-        void finishRender( uint64_t frameId ) override {
+        void finishRender(uint64_t generation, uint64_t frameId) override {
 
             using std::chrono::duration_cast;
 
             if (frameId < 2)
                 return;
 
-            const LatencyMarkers* m = m_latencyMarkers->getConstMarkers(frameId);
-            const LatencyMarkers* m_prev = m_latencyMarkers->getConstMarkers(frameId-1);
+            LatencyMarkers markers = m_latencyMarkers->getMarkers(generation, frameId);
+            LatencyMarkers markersPrev = m_latencyMarkers->getMarkers(generation, frameId-1);
+            const LatencyMarkers* m = &markers;
+            const LatencyMarkers* m_prev = &markersPrev;
 
             if (m->start == time_point{}) {
                 // must not happen, don't call this method if this is the case
@@ -298,6 +304,30 @@ namespace pacer {
 
 
         void endFrame( uint64_t frameId ) override { }
+
+        void resetAccountingGeneration(uint64_t generation) override {
+            (void)generation;
+            m_props.fill({});
+            m_propsFinished.store(0, std::memory_order_release);
+        }
+
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        void testSetPrediction(uint64_t frameId,
+                int32_t optimizedGpuTime) override {
+            SyncProps& props = m_props[frameId % m_props.size()];
+            props = {};
+            props.optimizedGpuTime = optimizedGpuTime;
+            m_propsFinished.store(frameId, std::memory_order_release);
+        }
+
+        uint64_t testGetPredictionFrame() const override {
+            return m_propsFinished.load(std::memory_order_acquire);
+        }
+
+        int32_t testGetPredictionGpuTime() const override {
+            return getSyncPrediction().optimizedGpuTime;
+        }
+#endif
 
 
 

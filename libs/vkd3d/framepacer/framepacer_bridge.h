@@ -56,6 +56,39 @@ struct pacer_queues {
     pacer_vulkan_queue_handle vulkan_queue;
 };
 
+struct pacer_present_attempt_token {
+    uint64_t accounting_epoch;
+    uint64_t simulation_id;
+    uint64_t attempt_generation;
+    uint32_t thread_id;
+};
+
+enum pacer_capture_acquire_result {
+    PACER_CAPTURE_NOT_REFLEX,
+    PACER_CAPTURE_ACQUIRED,
+    PACER_CAPTURE_NO_OPEN,
+    PACER_CAPTURE_AMBIGUOUS,
+    PACER_CAPTURE_STALE_EPOCH,
+};
+
+enum pacer_capture_retire_reason {
+    PACER_CAPTURE_RETIRE_BENIGN_ABORT,
+};
+
+struct pacer_command_capture_token {
+    uint64_t accounting_epoch;
+    uint64_t capture_generation;
+    uint64_t simulation_id;
+    uint64_t publication_lease_id;
+    uint64_t external_reflex_id;
+};
+
+struct pacer_command_capture_lease {
+    struct pacer_command_capture_token token;
+    uint32_t acquire_result;
+    bool active;
+};
+
 bool pacer_is_running( pacer_device_handle device );
 pacer_device_handle pacer_create_device( struct pacer_device_properties* properties, struct pacer_device_vk_procs* vk_procs );
 void pacer_destroy_device( pacer_device_handle handle );
@@ -72,7 +105,19 @@ void NvAPI_setLatencyMarker( pacer_device_handle handle, uint64_t frameId, VkLat
 void NvAPI_sleep( pacer_device_handle handle );
 
 uint64_t pacer_command_queue_notify_submit( pacer_command_queue_handle command_queue );
-void     pacer_command_queue_notify_vulkan_submit( pacer_command_queue_handle command_queue, uint64_t command_submit_id, uint64_t vulkan_submit_id );
+uint64_t pacer_command_queue_notify_legacy_submit(
+    pacer_command_queue_handle command_queue );
+struct pacer_command_capture_lease pacer_command_queue_acquire_capture(
+    pacer_command_queue_handle command_queue );
+uint64_t pacer_command_queue_commit_capture(
+    pacer_command_queue_handle command_queue,
+    struct pacer_command_capture_lease *lease );
+void pacer_command_queue_retire_capture(
+    pacer_command_queue_handle command_queue,
+    struct pacer_command_capture_lease *lease,
+    enum pacer_capture_retire_reason reason );
+bool     pacer_command_queue_notify_vulkan_submit( pacer_command_queue_handle command_queue, uint64_t command_submit_id, uint64_t vulkan_submit_id );
+void     pacer_queue_notify_submit_failed( struct pacer_queues pacer_queues, uint64_t command_submit_id, uint64_t vulkan_submit_id );
 
 void     pacer_queue_notify_gpu_execution_end( struct pacer_queues pacer_queues, uint64_t command_submit_id, uint64_t vulkan_submit_id, struct pacer_query_pool* query_pool );
 
@@ -82,8 +127,12 @@ struct pacer_query_pool* pacer_vulkan_queue_alloc_query_pool_top_of_pipe( pacer_
 void pacer_vulkan_queue_free_query_pool( pacer_vulkan_queue_handle vulkan_queue,  struct pacer_query_pool* query_pool);
 void pacer_vulkan_queue_push_query_pool_top_of_pipe( pacer_vulkan_queue_handle vulkan_queue, struct pacer_query_pool* query_pool, uint64_t vulkan_submit_id, bool push_into_queue );
 
-uint64_t pacer_notify_present( pacer_device_handle device, void* vkd3d_swapchain );
-void pacer_notify_aborted_present( pacer_device_handle device, void* vkd3d_swapchain );
+struct pacer_present_attempt_token pacer_begin_present_attempt(
+    pacer_device_handle device );
+uint64_t pacer_notify_present( pacer_device_handle device, void* vkd3d_swapchain,
+    uint64_t presentation_sequence, struct pacer_present_attempt_token attempt );
+void pacer_notify_aborted_present( pacer_device_handle device, void* vkd3d_swapchain,
+    struct pacer_present_attempt_token attempt );
 
 //void pacer_notify_gpu_present_end( pacer_device_handle handle, uint64_t frameId );
 

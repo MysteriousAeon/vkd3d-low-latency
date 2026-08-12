@@ -37,10 +37,22 @@ namespace pacer {
 
         virtual ~FramePacerMode() { }
 
-        virtual void startFrame( uint64_t frameId, time_point lastSimulationStart ) { }
+        virtual void startFrame(uint64_t generation, uint64_t frameId,
+                time_point lastSimulationStart) { }
         virtual void endFrame( uint64_t frameId ) { }
 
-        virtual void finishRender( uint64_t frameId ) { }
+        virtual void finishRender(uint64_t generation, uint64_t frameId) { }
+
+        /* Called with FramePacer::m_progressMutex held. Any state which can
+         * influence a pacing decision must not survive an accounting epoch. */
+        virtual void resetAccountingGeneration(uint64_t generation) { }
+
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        virtual void testSetPrediction(uint64_t frameId,
+                int32_t optimizedGpuTime) { }
+        virtual uint64_t testGetPredictionFrame() const { return 0; }
+        virtual int32_t testGetPredictionGpuTime() const { return 0; }
+#endif
 
         virtual void notifyQueueSubmit( uint64_t frameId, time_point t ) { }
         virtual void notifyGpuReady( uint64_t frameId, time_point t ) { }

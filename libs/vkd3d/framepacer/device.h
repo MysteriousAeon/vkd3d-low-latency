@@ -3,6 +3,7 @@
 #include "calibrated_device_timestamps.h"
 #include "vkd3d_dxgi1_2.h"
 #include "util/thread.h"
+#include <memory>
 #include <vector>
 
 namespace pacer {
@@ -36,25 +37,17 @@ namespace pacer {
         void getCommandQueues( std::vector<CommandQueue*>& outQueues );
         void getVulkanQueues( std::vector<VulkanQueue*>& outQueues );
 
-        enum type_t : uint16_t {
-            WaitableDXGISwapchain = 0,
-            NVIDIA_Reflex = 1,
-            AMD_AntiLag2 = 2
-        };
-
-        std::atomic< type_t > m_activeType = { WaitableDXGISwapchain };
-
         pacer_device_properties m_properties;
         pacer_device_vk_procs   m_vkProcs;
         CalibratedDeviceTimestamps m_calibratedDeviceTimestamps;
-
-        NvApi_PacingAdapter* m_nvApi_pacingAdapter;
 
         // todo: make those two atomic together
         std::atomic< void* > m_activeSwapchain = { nullptr };
         std::atomic< CommandQueue* > m_primaryCommandQueue = { nullptr };
 
-        FramePacer* m_pacer;
+        /* Declare the pacer first so the adapter is destroyed before it. */
+        std::unique_ptr<FramePacer> m_pacer;
+        std::unique_ptr<NvApi_PacingAdapter> m_nvApi_pacingAdapter;
 
     private:
 

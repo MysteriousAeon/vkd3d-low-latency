@@ -1,14 +1,27 @@
 #include "framepacer.h"
 #include "framepacer_mode_low_latency.h"
 #include "framepacer_mode_min_latency.h"
+#include <algorithm>
 #include <string>
 #include <stdint.h>
 
 namespace pacer {
 
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    std::atomic<bool> g_testLastTeardownWorkerStopped = { false };
+#endif
+
     FramePacer::FramePacer( Device* device, uint64_t firstFrameId )
-    : m_device(device), m_waitableDxgiSwapchain( device, m_latencyMarkers, m_frameSync,
-        [this](uint64_t frameId, time_point t) { this->sleep(frameId, t); } ) {
+    : m_device(device), m_latencyMarkers(2), m_simulationLedger(firstFrameId),
+      m_waitableDxgiSwapchain( device, m_latencyMarkers, m_frameSync,
+        [this]() { return this->getAccountingState(); },
+        [this](uint64_t frameId, time_point t, uint64_t accountingState) {
+            return this->sleep(frameId, t, accountingState);
+        } ),
+      m_firstFrameId(firstFrameId) {
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        g_testLastTeardownWorkerStopped.store(false, std::memory_order_release);
+#endif
         // We'll default to LOW_LATENCY, which generally provides the best "input lag"
         // along with time consistency and often appears the smoothest too.
         // MAX_FRAME_LATENCY can have advantages in some games like God of War that provide inconsistent
@@ -70,9 +83,206 @@ namespace pacer {
 
     FramePacer::~FramePacer() {
 
+        /* The worker can enter sleep(), which reads accounting state, the mode,
+         * and marker storage. Stop it before destructor-body work or member
+         * destruction can invalidate any of those objects. */
+        m_waitableDxgiSwapchain.stop();
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        g_testLastTeardownWorkerStopped.store(
+                m_waitableDxgiSwapchain.stopped(), std::memory_order_release);
+#endif
+
         delete m_presentationStats.load();
         delete m_gpuBufferStats.load();
 
+    }
+
+    void FramePacer::setReflexMode(bool enable) {
+        std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        uint64_t oldState = m_accountingState.load(std::memory_order_relaxed);
+
+        if (isReflexAccountingState(oldState) == enable)
+            return;
+
+        uint64_t newState = (((oldState >> 1) + 1) << 1) | (enable ? 1 : 0);
+        if (enable) {
+            m_simulationLedger.activateEpoch(newState, m_firstFrameId);
+        } else {
+            m_simulationLedger.deactivateEpoch(oldState);
+        }
+
+        /* Timeline values are meaningful only together with accountingState.
+         * Begin each legacy or Reflex generation from a neutral baseline so an
+         * abandoned generation's numeric holes cannot be consumed by the next. */
+        m_frameSync.cpuFinished.signal(m_firstFrameId - 1);
+        m_frameSync.gpuFinished.signal(m_firstFrameId - 1);
+        m_frameSync.frameFinished.signal(m_firstFrameId - 1);
+        m_latencyMarkers.setGeneration(newState);
+        m_frameMapping.setGeneration(newState);
+        m_mode->resetAccountingGeneration(newState);
+        m_accountingState.store(newState, std::memory_order_release);
+        m_frameSync.gpuFinished.wake();
+    }
+
+    uint64_t FramePacer::beginReflexSimulation(uint64_t accountingEpoch,
+            uint64_t externalReflexId, uint32_t threadId, time_point start) {
+        std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        uint64_t simulationId = m_simulationLedger.beginSimulation(
+                accountingEpoch, externalReflexId, threadId, start);
+        if (!simulationId)
+            return 0;
+        m_latencyMarkers.updateMarkers(accountingEpoch, simulationId,
+                [&](LatencyMarkers& markers) {
+            if (markers.start == time_point{})
+                markers.start = start;
+        });
+        return simulationId;
+    }
+
+    void FramePacer::beginReflexRenderSubmit(uint64_t accountingEpoch,
+            uint64_t externalReflexId, uint32_t threadId, int32_t renderStart) {
+        std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        m_simulationLedger.openRenderCapture(accountingEpoch,
+                externalReflexId, threadId, renderStart);
+    }
+
+    void FramePacer::endReflexRenderSubmit(uint64_t accountingEpoch,
+            uint64_t externalReflexId, uint32_t threadId, int32_t renderEnd) {
+        std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        applySimulationProgress(m_simulationLedger.closeRenderCapture(
+                accountingEpoch, externalReflexId, threadId, renderEnd));
+    }
+
+    PresentAttemptToken FramePacer::beginReflexPresent(uint64_t accountingEpoch,
+            uint64_t simulationId, uint32_t threadId,
+            const FrameInfo& frameInfo) {
+        std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        PresentAttemptToken attemptToken;
+        applySimulationProgress(m_simulationLedger.beginPresent(accountingEpoch,
+                simulationId, threadId, frameInfo.renderStart,
+                frameInfo.renderEnd, &attemptToken));
+        if (attemptToken)
+            m_uncapturedPresentAttempts[threadId] = attemptToken;
+        return attemptToken;
+    }
+
+    void FramePacer::endReflexPresent(uint64_t accountingEpoch,
+            uint64_t simulationId, uint32_t threadId) {
+        std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        auto uncaptured = m_uncapturedPresentAttempts.find(threadId);
+        if (uncaptured != m_uncapturedPresentAttempts.end() &&
+                uncaptured->second.accountingEpoch == accountingEpoch &&
+                uncaptured->second.simulationId == simulationId)
+            m_uncapturedPresentAttempts.erase(uncaptured);
+        applySimulationProgress(m_simulationLedger.endPresent(accountingEpoch,
+                simulationId, threadId));
+    }
+
+    PresentAttemptToken FramePacer::capturePresentAttempt() {
+        std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        uint64_t accountingState = getAccountingState();
+        uint32_t threadId = dxvk::this_thread::get_id();
+        auto uncaptured = m_uncapturedPresentAttempts.find(threadId);
+
+        if (uncaptured != m_uncapturedPresentAttempts.end()) {
+            PresentAttemptToken attemptToken = uncaptured->second;
+            m_uncapturedPresentAttempts.erase(uncaptured);
+            return attemptToken;
+        }
+
+        if (isReflexAccountingState(accountingState))
+            return {};
+
+        return {accountingState, 0,
+                m_nextLegacyPresentAttempt.fetch_add(1, std::memory_order_relaxed),
+                threadId};
+    }
+
+    bool FramePacer::notifyReflexPresent(const PresentAttemptToken& attemptToken,
+            void* swapchain, uint64_t sequence) {
+        std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        if (getAccountingState() != attemptToken.accountingEpoch ||
+                !isReflexAccountingState(attemptToken.accountingEpoch))
+            return false;
+        applySimulationProgress(m_simulationLedger.recordPresent(
+                attemptToken, swapchain, sequence));
+        return true;
+    }
+
+    void FramePacer::cancelReflexPresent(
+            const PresentAttemptToken& attemptToken) {
+        std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        applySimulationProgress(m_simulationLedger.cancelPresent(
+                attemptToken));
+    }
+
+    void FramePacer::forceReflexPacingBypass() {
+        std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        if (isReflexAccountingState(getAccountingState()))
+            m_simulationLedger.forcePacingBypass();
+    }
+
+    void FramePacer::accountReflexCompletion(SubmitRecord& submit,
+            void* commandQueue, uint64_t commandGeneration, void* vulkanQueue,
+            uint64_t vulkanGeneration, uint64_t gpuTimestamp) {
+        std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        applySimulationProgress(m_simulationLedger.accountCompletion(submit,
+                commandQueue, commandGeneration, vulkanQueue,
+                vulkanGeneration, gpuTimestamp));
+    }
+
+    void FramePacer::abandonReflexSubmit(SubmitRecord& submit,
+            void* commandQueue, uint64_t commandGeneration, void* vulkanQueue,
+            uint64_t vulkanGeneration) {
+        std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        applySimulationProgress(m_simulationLedger.abandonSubmit(submit,
+                commandQueue, commandGeneration, vulkanQueue,
+                vulkanGeneration));
+    }
+
+    void FramePacer::retireCaptureLease(const CaptureToken& token,
+            CaptureRetireReason reason) {
+        std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        applySimulationProgress(m_simulationLedger.retireCaptureLease(
+                token, reason));
+    }
+
+    void FramePacer::applySimulationProgress(SimulationProgress&& progress) {
+        if (!progress.accountingEpoch ||
+                progress.accountingEpoch != m_accountingState.load(std::memory_order_acquire) ||
+                !isReflexAccountingState(progress.accountingEpoch))
+            return;
+        for (const SimulationProgress::CpuCompletion& completion : progress.cpu) {
+            m_frameMapping.registerMapping(progress.accountingEpoch,
+                    completion.simulationId, completion.externalReflexId);
+            m_latencyMarkers.updateMarkers(progress.accountingEpoch,
+                    completion.simulationId, [&](LatencyMarkers& markers) {
+                markers.start = completion.start;
+                markers.renderStart = completion.renderStart;
+                markers.renderEnd = completion.renderEnd;
+                markers.cpuFinished = completion.cpuFinished;
+            });
+            m_frameSync.cpuFinished.signal(completion.simulationId);
+        }
+
+        if (!progress.gpu.empty())
+            m_device->m_calibratedDeviceTimestamps.calibrate();
+
+        for (const SimulationProgress::GpuCompletion& completion : progress.gpu) {
+            time_point timestamp = m_device->m_calibratedDeviceTimestamps.getHostTimestamp(
+                    completion.gpuTimestamp);
+
+            m_latencyMarkers.updateMarkers(progress.accountingEpoch,
+                    completion.simulationId, [&](LatencyMarkers& markers) {
+                markers.gpuFinished = timestamp;
+            });
+            m_frameSync.gpuFinished.signal(completion.simulationId);
+            LatencyMarkers markers = m_latencyMarkers.getMarkers(
+                    progress.accountingEpoch, completion.simulationId);
+            if (markers.start != time_point{})
+                m_mode->finishRender(progress.accountingEpoch,
+                        completion.simulationId);
+        }
     }
 
 }

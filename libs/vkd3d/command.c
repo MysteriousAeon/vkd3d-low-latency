@@ -808,14 +808,12 @@ static void vkd3d_wait_for_gpu_timeline_semaphore(struct vkd3d_fence_worker *wor
 {
     struct d3d12_device *device = worker->device;
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    const struct d3d12_command_queue *queue;
+    struct vkd3d_queue *submission_queue;
     VkSemaphoreWaitInfo wait_info;
     uint64_t timeout = UINT64_MAX;
     VkResult vr;
 
-    /* The underlying vkd3d_queue could in theory spuriously change with out-of-band override on startup,
-     * so don't cache the pointer to vkd3d_queue just in case. */
-    queue = worker->queue;
+    submission_queue = fence->fence_info.submission_queue;
 
     if (fence->fence_info.vk_semaphore)
     {
@@ -837,42 +835,53 @@ static void vkd3d_wait_for_gpu_timeline_semaphore(struct vkd3d_fence_worker *wor
         if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS) || VKD3D_CONFIG_FLAG_IS_SET(FAULT))
             timeout = 5000000000ull;
 
-        if (d3d12_device_has_slow_cpu_timeline_semaphores(device) &&
-            fence->fence_info.vk_semaphore == queue->vkd3d_queue->submission_timeline)
+        if (submission_queue && d3d12_device_has_slow_cpu_timeline_semaphores(device) &&
+                fence->fence_info.vk_semaphore == submission_queue->submission_timeline)
         {
-            vr = vkd3d_queue_wait_submission_timeline(queue->vkd3d_queue, fence->fence_info.vk_semaphore_value, timeout);
+            vr = vkd3d_queue_wait_submission_timeline(submission_queue,
+                    fence->fence_info.vk_semaphore_value, timeout);
         }
         else
         {
             vr = VK_CALL(vkWaitSemaphores(device->vk_device, &wait_info, timeout));
-            if (vr == VK_SUCCESS && fence->fence_info.vk_semaphore == queue->vkd3d_queue->submission_timeline)
-                vkd3d_queue_update_observed_cpu_timeline(queue->vkd3d_queue, fence->fence_info.vk_semaphore_value);
+            if (vr == VK_SUCCESS && submission_queue &&
+                    fence->fence_info.vk_semaphore == submission_queue->submission_timeline)
+                vkd3d_queue_update_observed_cpu_timeline(submission_queue,
+                        fence->fence_info.vk_semaphore_value);
         }
 
         if (vr != VK_SUCCESS)
         {
             ERR("Failed to wait for Vulkan timeline semaphore, vr %d.\n", vr);
             VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, vr == VK_ERROR_DEVICE_LOST || vr == VK_TIMEOUT);
-            if (worker->queue->pacer_queues.vulkan_queue && fence->fence_info.pacer_command_submit_id != 0
+            if (fence->fence_info.pacer_queues.vulkan_queue && fence->fence_info.pacer_command_submit_id != 0
                 && fence->fence_info.pacer_vulkan_submit_id != 0) {
                 pacer_queue_notify_gpu_execution_end(
-                    worker->queue->pacer_queues,
+                    fence->fence_info.pacer_queues,
                     fence->fence_info.pacer_command_submit_id,
                     fence->fence_info.pacer_vulkan_submit_id,
                     fence->fence_info.pacer_query_pool);
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+                d3d12_command_queue_test_transition_hook(worker->queue,
+                        VKD3D_TEST_QUEUE_TRANSITION_HOOK_PACER_GPU_COMPLETE);
+#endif
             }
 
             vkd3d_waiting_fence_complete_submissions(device, worker, fence, false);
             return;
         }
 
-        if (worker->queue->pacer_queues.vulkan_queue && fence->fence_info.pacer_command_submit_id != 0
+        if (fence->fence_info.pacer_queues.vulkan_queue && fence->fence_info.pacer_command_submit_id != 0
             && fence->fence_info.pacer_vulkan_submit_id != 0 ) {
             pacer_queue_notify_gpu_execution_end(
-                worker->queue->pacer_queues,
+                fence->fence_info.pacer_queues,
                 fence->fence_info.pacer_command_submit_id,
                 fence->fence_info.pacer_vulkan_submit_id,
                 fence->fence_info.pacer_query_pool);
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+            d3d12_command_queue_test_transition_hook(worker->queue,
+                    VKD3D_TEST_QUEUE_TRANSITION_HOOK_PACER_GPU_COMPLETE);
+#endif
         }
 
         /* This is a good time to kick the debug threads into action. */
@@ -1378,7 +1387,7 @@ static HRESULT d3d12_fence_signal_cpu_timeline_semaphore(struct d3d12_fence *fen
 }
 
 static uint64_t d3d12_fence_add_pending_signal_locked(struct d3d12_fence *fence, uint64_t virtual_value,
-        const struct d3d12_command_queue *signalling_queue)
+        const struct vkd3d_queue *submission_queue, uint64_t submission_timeline_value)
 {
     struct d3d12_fence_value *update;
     vkd3d_array_reserve((void**)&fence->pending_updates, &fence->pending_updates_size,
@@ -1387,8 +1396,8 @@ static uint64_t d3d12_fence_add_pending_signal_locked(struct d3d12_fence *fence,
     update = &fence->pending_updates[fence->pending_updates_count++];
     update->virtual_value = virtual_value;
     update->update_count = ++fence->update_count;
-    update->vk_semaphore = signalling_queue->vkd3d_queue->submission_timeline;
-    update->vk_semaphore_value = signalling_queue->last_submission_timeline_value;
+    update->vk_semaphore = submission_queue->submission_timeline;
+    update->vk_semaphore_value = submission_timeline_value;
     return fence->update_count;
 }
 
@@ -22218,6 +22227,63 @@ struct d3d12_command_list *d3d12_command_list_from_iface(ID3D12CommandList *ifac
 /* ID3D12CommandQueue */
 extern ULONG STDMETHODCALLTYPE d3d12_command_queue_vkd3d_ext_AddRef(d3d12_command_queue_vkd3d_ext_iface *iface);
 
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+static VKD3D_THREAD_LOCAL unsigned int vkd3d_test_queue_transition_hook_callback_depth;
+
+void d3d12_command_queue_test_transition_hook(struct d3d12_command_queue *command_queue,
+        enum vkd3d_test_queue_transition_hook_point point)
+{
+    struct vkd3d_test_queue_transition_hook hook;
+
+    pthread_mutex_lock(&command_queue->test_queue_transition_hook_mutex);
+    hook = command_queue->test_queue_transition_hook;
+    if (hook.callback)
+        ++command_queue->test_queue_transition_hook_in_flight;
+    pthread_mutex_unlock(&command_queue->test_queue_transition_hook_mutex);
+
+    if (!hook.callback)
+        return;
+
+    ++vkd3d_test_queue_transition_hook_callback_depth;
+    hook.callback(point, hook.userdata);
+    --vkd3d_test_queue_transition_hook_callback_depth;
+
+    pthread_mutex_lock(&command_queue->test_queue_transition_hook_mutex);
+    assert(command_queue->test_queue_transition_hook_in_flight);
+    if (!--command_queue->test_queue_transition_hook_in_flight)
+        pthread_cond_broadcast(&command_queue->test_queue_transition_hook_cond);
+    pthread_mutex_unlock(&command_queue->test_queue_transition_hook_mutex);
+}
+
+static HRESULT d3d12_command_queue_set_test_transition_hook(
+        struct d3d12_command_queue *command_queue,
+        const struct vkd3d_test_queue_transition_hook *hook)
+{
+    if (vkd3d_test_queue_transition_hook_callback_depth)
+        return E_UNEXPECTED;
+
+    pthread_mutex_lock(&command_queue->test_queue_transition_hook_mutex);
+    while (command_queue->test_queue_transition_hook_updating)
+        pthread_cond_wait(&command_queue->test_queue_transition_hook_cond,
+                &command_queue->test_queue_transition_hook_mutex);
+
+    command_queue->test_queue_transition_hook_updating = true;
+    memset(&command_queue->test_queue_transition_hook, 0,
+            sizeof(command_queue->test_queue_transition_hook));
+    pthread_cond_broadcast(&command_queue->test_queue_transition_hook_cond);
+    while (command_queue->test_queue_transition_hook_in_flight)
+        pthread_cond_wait(&command_queue->test_queue_transition_hook_cond,
+                &command_queue->test_queue_transition_hook_mutex);
+
+    if (hook)
+        command_queue->test_queue_transition_hook = *hook;
+    command_queue->test_queue_transition_hook_updating = false;
+    pthread_cond_broadcast(&command_queue->test_queue_transition_hook_cond);
+    pthread_mutex_unlock(&command_queue->test_queue_transition_hook_mutex);
+    return S_OK;
+}
+#endif
+
 static inline struct d3d12_command_queue *impl_from_ID3D12CommandQueue(ID3D12CommandQueue *iface)
 {
     return CONTAINING_RECORD(iface, struct d3d12_command_queue, ID3D12CommandQueue_iface);
@@ -22311,6 +22377,12 @@ ULONG STDMETHODCALLTYPE d3d12_command_queue_Release(ID3D12CommandQueue *iface)
 
         vkd3d_fence_worker_stop(&command_queue->fence_worker, device);
 
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        d3d12_command_queue_set_test_transition_hook(command_queue, NULL);
+        pthread_cond_destroy(&command_queue->test_queue_transition_hook_cond);
+        pthread_mutex_destroy(&command_queue->test_queue_transition_hook_mutex);
+#endif
+
         vkd3d_free(command_queue->submissions);
         vkd3d_free(command_queue->wait_semaphores);
         vkd3d_free(command_queue->wait_fences);
@@ -22333,6 +22405,23 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_queue_GetPrivateData(ID3D12Comman
 
     TRACE("iface %p, guid %s, data_size %p, data %p.\n", iface, debugstr_guid(guid), data_size, data);
 
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    if (IsEqualGUID(guid, &VKD3D_TEST_QUEUE_TRANSITION_HOOK_DRAIN_GUID))
+    {
+        if (!data_size)
+            return E_INVALIDARG;
+        pthread_mutex_lock(&command_queue->test_queue_transition_hook_mutex);
+        while (!command_queue->test_queue_transition_hook_updating ||
+                !command_queue->test_queue_transition_hook_in_flight)
+            pthread_cond_wait(&command_queue->test_queue_transition_hook_cond,
+                    &command_queue->test_queue_transition_hook_mutex);
+        pthread_mutex_unlock(&command_queue->test_queue_transition_hook_mutex);
+        *data_size = 0;
+        return S_OK;
+    }
+
+#endif
+
     return vkd3d_get_private_data(&command_queue->private_store, guid, data_size, data);
 }
 
@@ -22342,6 +22431,19 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_queue_SetPrivateData(ID3D12Comman
     struct d3d12_command_queue *command_queue = impl_from_ID3D12CommandQueue(iface);
 
     TRACE("iface %p, guid %s, data_size %u, data %p.\n", iface, debugstr_guid(guid), data_size, data);
+
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    if (IsEqualGUID(guid, &VKD3D_TEST_QUEUE_TRANSITION_HOOK_GUID))
+    {
+        if (!data_size)
+            return d3d12_command_queue_set_test_transition_hook(command_queue, NULL);
+
+        if (!data || data_size != sizeof(command_queue->test_queue_transition_hook))
+            return E_INVALIDARG;
+
+        return d3d12_command_queue_set_test_transition_hook(command_queue, data);
+    }
+#endif
 
     return vkd3d_set_private_data(&command_queue->private_store, guid, data_size, data,
             NULL, NULL);
@@ -22734,27 +22836,51 @@ out:
     return ret;
 }
 
+static void d3d12_command_queue_prepare_pacer_submission(
+        struct d3d12_command_queue *command_queue,
+        struct d3d12_command_queue_submission_execute *execute,
+        struct pacer_command_capture_lease *capture_lease)
+{
+    if (command_queue->desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT
+            || command_queue->desc.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE
+            || command_queue->desc.Type == D3D12_COMMAND_LIST_TYPE_COPY)
+    {
+        execute->pacer_queues = command_queue->pacer_queues;
+        if (capture_lease->active)
+            execute->pacer_command_submit_id = pacer_command_queue_commit_capture(
+                    execute->pacer_queues.command_queue, capture_lease);
+        else if (capture_lease->acquire_result == PACER_CAPTURE_NOT_REFLEX)
+            execute->pacer_command_submit_id = pacer_command_queue_notify_legacy_submit(
+                    execute->pacer_queues.command_queue);
+        if (!execute->pacer_command_submit_id)
+            memset(&execute->pacer_queues, 0, sizeof(execute->pacer_queues));
+    }
+}
+
 static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQueue *iface,
         UINT command_list_count, ID3D12CommandList * const *command_lists)
 {
     struct d3d12_command_queue *command_queue = impl_from_ID3D12CommandQueue(iface);
-    struct vkd3d_queue_timeline_trace_cookie timeline_cookie;
+    struct vkd3d_queue_timeline_trace_cookie timeline_cookie = {0};
+    struct pacer_command_capture_lease capture_lease = {0};
     struct vkd3d_initial_transition *transitions;
     size_t num_transitions, num_command_buffers;
-    VkCommandBufferSubmitInfo *buffers, *buffer;
-    struct d3d12_command_allocator **allocators;
-    struct d3d12_command_queue_submission sub;
+    VkCommandBufferSubmitInfo *buffers = NULL, *buffer;
+    struct d3d12_command_allocator **allocators = NULL;
+    struct d3d12_command_queue_submission sub = {0};
     unsigned int indirect_barrier_hoist_index;
     unsigned int fixup_sink_begin_index;
     struct d3d12_command_list *cmd_list;
 #ifdef VKD3D_ENABLE_BREADCRUMBS
-    unsigned int *breadcrumb_indices;
+    unsigned int *breadcrumb_indices = NULL;
 #endif
     unsigned int cmd_submit_count;
     bool hazard_query_resets;
-    uint32_t *cmd_cost;
+    uint32_t *cmd_cost = NULL;
     unsigned int iter;
     unsigned int i;
+    bool timeline_registered = false;
+    bool queued = false;
     HRESULT hr;
 
     TRACE("iface %p, command_list_count %u, command_lists %p.\n",
@@ -22763,14 +22889,24 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     if (!command_list_count)
         return;
 
+    capture_lease = pacer_command_queue_acquire_capture(
+            command_queue->pacer_queues.command_queue);
+
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    d3d12_command_queue_test_transition_hook(command_queue,
+            VKD3D_TEST_QUEUE_TRANSITION_HOOK_EXECUTE_CAPTURE_ACQUIRED);
+    /* This hook is anchored to the first preparation operation so tests can
+     * prove that capture ownership was acquired before preparation begins. */
+    d3d12_command_queue_test_transition_hook(command_queue,
+            VKD3D_TEST_QUEUE_TRANSITION_HOOK_EXECUTE_PREPARATION_BEGIN);
+#endif
+
     if (FAILED(hr = vkd3d_memory_transfer_queue_flush(&command_queue->device->memory_transfers)))
     {
         d3d12_device_mark_as_removed(command_queue->device, hr,
                 "Failed to execute pending memory clears.\n");
-        return;
+        goto cleanup;
     }
-
-    memset(&sub, 0, sizeof(sub));
 
     /* ExecuteCommandLists submission barrier buffer */
     num_command_buffers = command_queue->vkd3d_queue->barrier_command_buffer ? 1 : 0;
@@ -22798,7 +22934,7 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
         if (!cmd_list)
         {
             WARN("Unsupported command list type %p.\n", cmd_list);
-            return;
+            goto cleanup;
         }
 
 #ifdef VKD3D_ENABLE_PROFILING
@@ -22834,20 +22970,19 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     if (!(buffers = vkd3d_calloc(num_command_buffers, sizeof(*buffers))))
     {
         ERR("Failed to allocate command buffer array.\n");
-        return;
+        goto cleanup;
     }
 
     if (!(allocators = vkd3d_calloc(command_list_count, sizeof(*allocators))))
     {
         ERR("Failed to allocate outstanding submissions count.\n");
-        vkd3d_free(buffers);
-        return;
+        goto cleanup;
     }
 
     if (!(cmd_cost = vkd3d_calloc(num_command_buffers, sizeof(*cmd_cost))))
     {
         ERR("Failed to allocate command buffer cost array.\n");
-        return;
+        goto cleanup;
     }
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
@@ -22860,6 +22995,7 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     timeline_cookie = vkd3d_queue_timeline_trace_register_execute(
             &command_queue->device->queue_timeline_trace,
             command_lists, command_list_count);
+    timeline_registered = true;
 
     num_transitions = 0;
     cmd_submit_count = 0;
@@ -22924,15 +23060,7 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
                         "Command list %p is not associated with an allocator.\n", command_lists[i]);
             }
 
-            vkd3d_free(allocators);
-            vkd3d_free(buffers);
-            vkd3d_free(cmd_cost);
-#ifdef VKD3D_ENABLE_BREADCRUMBS
-            vkd3d_free(breadcrumb_indices);
-#endif
-            vkd3d_queue_timeline_trace_complete_execute(&command_queue->device->queue_timeline_trace,
-                    NULL, timeline_cookie);
-            return;
+            goto cleanup;
         }
 
         num_transitions += cmd_list->init_transitions_count;
@@ -23106,6 +23234,11 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     else if (num_transitions != 0)
     {
         sub.execute.transitions = vkd3d_malloc(num_transitions * sizeof(*sub.execute.transitions));
+        if (!sub.execute.transitions)
+        {
+            ERR("Failed to allocate initial transition array.\n");
+            goto cleanup;
+        }
         sub.execute.transition_count = num_transitions;
         transitions = sub.execute.transitions;
         for (i = 0; i < command_list_count; ++i)
@@ -23123,29 +23256,49 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
         sub.execute.transition_count = 0;
     }
 
-    assert(cmd_submit_count == num_command_buffers);
-
     sub.type = VKD3D_SUBMISSION_EXECUTE;
     sub.execute.cmd = buffers;
     sub.execute.cmd_cost = cmd_cost;
-    sub.execute.cmd_count = cmd_submit_count;
     sub.execute.command_allocators = allocators;
     sub.execute.num_command_allocators = command_list_count;
-    for (i = 0; i < command_list_count; i++)
-        d3d12_command_allocator_inc_ref(allocators[i]);
-    sub.execute.low_latency_frame_id = command_queue->device->frame_markers.render;
+    sub.execute.low_latency_frame_id = capture_lease.active
+            ? capture_lease.token.external_reflex_id : 0;
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     sub.execute.breadcrumb_indices = breadcrumb_indices;
     sub.execute.breadcrumb_indices_count = breadcrumb_indices ? command_list_count : 0;
 #endif
     sub.execute.timeline_cookie = timeline_cookie;
-    if (command_queue->desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT
-        || command_queue->desc.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE
-        || command_queue->desc.Type == D3D12_COMMAND_LIST_TYPE_COPY)
-        sub.execute.pacer_command_submit_id = pacer_command_queue_notify_submit(command_queue->pacer_queues.command_queue);
+
+    assert(cmd_submit_count <= num_command_buffers);
+    d3d12_command_queue_prepare_pacer_submission(command_queue,
+            &sub.execute, &capture_lease);
 //     INFO( "submit to command queue %" PRIu64 " with type %" PRIu16 " \n", (uintptr_t) command_queue, command_queue->desc.Type );
 
+    sub.execute.cmd_count = cmd_submit_count;
+    for (i = 0; i < command_list_count; i++)
+        d3d12_command_allocator_inc_ref(allocators[i]);
     d3d12_command_queue_add_submission(command_queue, &sub);
+    queued = true;
+
+cleanup:
+    if (capture_lease.active)
+        pacer_command_queue_retire_capture(
+                command_queue->pacer_queues.command_queue, &capture_lease,
+                PACER_CAPTURE_RETIRE_BENIGN_ABORT);
+    if (!queued)
+    {
+        vkd3d_free(sub.execute.transitions);
+        vkd3d_free(allocators);
+        vkd3d_free(buffers);
+        vkd3d_free(cmd_cost);
+#ifdef VKD3D_ENABLE_BREADCRUMBS
+        vkd3d_free(breadcrumb_indices);
+#endif
+        if (timeline_registered)
+            vkd3d_queue_timeline_trace_complete_execute(
+                    &command_queue->device->queue_timeline_trace,
+                    NULL, timeline_cookie);
+    }
 }
 
 static void STDMETHODCALLTYPE d3d12_command_queue_SetMarker(ID3D12CommandQueue *iface,
@@ -23431,6 +23584,7 @@ static void vkd3d_waiting_fence_ensure_signal_order(
 static void d3d12_command_queue_push_fence_waits_to_worker(struct d3d12_command_queue *command_queue)
 {
     struct vkd3d_fence_worker *worker = &command_queue->fence_worker;
+    struct vkd3d_queue *submission_queue = command_queue->vkd3d_queue;
     struct vkd3d_waiting_fence_signal_order_info *order_info;
     struct vkd3d_queue_timeline_trace_cookie cookie;
     struct vkd3d_fence_virtual_wait *fence_wait;
@@ -23454,6 +23608,8 @@ static void d3d12_command_queue_push_fence_waits_to_worker(struct d3d12_command_
              * waited on by multiple threads, which could happen in this code path. See issue 2256 for more details. */
             fence_info.vk_semaphore = fence_wait->vk_semaphore;
             fence_info.vk_semaphore_value = fence_wait->vk_semaphore_value;
+            if (fence_wait->vk_semaphore == submission_queue->submission_timeline)
+                fence_info.submission_queue = submission_queue;
         }
 
         /* We must ensure signal order being correct.
@@ -23767,11 +23923,16 @@ static void d3d12_command_queue_signal(struct d3d12_command_queue *command_queue
     struct vkd3d_waiting_fence_signal_info *signal_info;
     struct vkd3d_queue_timeline_trace_cookie cookie;
     struct vkd3d_fence_wait_info fence_info;
+    struct vkd3d_queue *submission_queue;
+    uint64_t submission_timeline_value;
     uint64_t update_count;
     HRESULT hr;
 
+    submission_queue = command_queue->vkd3d_queue;
+    submission_timeline_value = command_queue->last_submission_timeline_value;
+
     TRACE("queue %p, fence %p, value %#"PRIx64", vk_semaphore %p, vk_semaphore_value %#"PRIx64".\n", command_queue,
-            fence, value, command_queue->vkd3d_queue->submission_timeline, command_queue->last_submission_timeline_value);
+            fence, value, submission_queue->submission_timeline, submission_timeline_value);
 
     assert(!fence->timeline_semaphore);
 
@@ -23780,11 +23941,13 @@ static void d3d12_command_queue_signal(struct d3d12_command_queue *command_queue
 
     d3d12_fence_lock(fence);
 
-    update_count = d3d12_fence_add_pending_signal_locked(fence, value, command_queue);
+    update_count = d3d12_fence_add_pending_signal_locked(fence, value,
+            submission_queue, submission_timeline_value);
 
     memset(&fence_info, 0, sizeof(fence_info));
-    fence_info.vk_semaphore = command_queue->vkd3d_queue->submission_timeline;
-    fence_info.vk_semaphore_value = command_queue->last_submission_timeline_value;
+    fence_info.vk_semaphore = submission_queue->submission_timeline;
+    fence_info.vk_semaphore_value = submission_timeline_value;
+    fence_info.submission_queue = submission_queue;
 
     signal_info = vkd3d_waiting_fence_set_callback(&fence_info,
             &vkd3d_waiting_fence_signal_fence, sizeof(*signal_info));
@@ -23893,6 +24056,7 @@ static void d3d12_command_queue_signal_shared(struct d3d12_command_queue *comman
     memset(&fence_info, 0, sizeof(fence_info));
     fence_info.vk_semaphore = vkd3d_queue->submission_timeline;
     fence_info.vk_semaphore_value = vkd3d_queue->submission_timeline_count;
+    fence_info.submission_queue = vkd3d_queue;
 
     release_info = vkd3d_waiting_fence_set_callback(&fence_info,
             &vkd3d_waiting_fence_release_fence, sizeof(*release_info));
@@ -23925,11 +24089,14 @@ static void d3d12_command_queue_defer_release_resource(struct d3d12_command_queu
 {
     struct vkd3d_waiting_fence_defer_release_resource_info *release_info;
     struct vkd3d_fence_wait_info fence_info;
+    struct vkd3d_queue *submission_queue;
     HRESULT hr;
 
+    submission_queue = command_queue->vkd3d_queue;
     memset(&fence_info, 0, sizeof(fence_info));
-    fence_info.vk_semaphore = command_queue->vkd3d_queue->submission_timeline;
+    fence_info.vk_semaphore = submission_queue->submission_timeline;
     fence_info.vk_semaphore_value = command_queue->last_submission_timeline_value;
+    fence_info.submission_queue = submission_queue;
 
     release_info = vkd3d_waiting_fence_set_callback(&fence_info,
             &vkd3d_waiting_fence_release_resource, sizeof(*release_info));
@@ -24365,12 +24532,6 @@ static struct pacer_cmd_injection inject_pacer_timestamps( bool is_first, bool i
 
     if (is_first)
     {
-        res.query_pool_top_of_pipe = pacer_vulkan_queue_alloc_query_pool_top_of_pipe(
-            pacer_queues.vulkan_queue);
-        assert( res.query_pool_top_of_pipe != NULL );
-        ext_cmds_size += 1;
-        copy_start = 1;
-
         // notify vulkan submit
         if (pacer_queues.vulkan_queue)
         {
@@ -24379,11 +24540,25 @@ static struct pacer_cmd_injection inject_pacer_timestamps( bool is_first, bool i
                     pacer_vulkan_queue_notify_submit(
                     pacer_queues.vulkan_queue
                     );
-            pacer_command_queue_notify_vulkan_submit(
+            if (!exec->pacer_vulkan_submit_id ||
+                    !pacer_command_queue_notify_vulkan_submit(
                     pacer_queues.command_queue,
                     exec->pacer_command_submit_id,
-                    exec->pacer_vulkan_submit_id);
+                    exec->pacer_vulkan_submit_id))
+            {
+                pacer_queue_notify_submit_failed(pacer_queues,
+                        exec->pacer_command_submit_id,
+                        exec->pacer_vulkan_submit_id);
+                memset(&exec->pacer_queues, 0, sizeof(exec->pacer_queues));
+                return res;
+            }
         }
+
+        res.query_pool_top_of_pipe = pacer_vulkan_queue_alloc_query_pool_top_of_pipe(
+            pacer_queues.vulkan_queue);
+        assert( res.query_pool_top_of_pipe != NULL );
+        ext_cmds_size += 1;
+        copy_start = 1;
     }
 
     if (is_last)
@@ -24483,6 +24658,9 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
     if (!(vk_queue = vkd3d_queue_acquire(vkd3d_queue)))
     {
         ERR("Failed to acquire queue %p.\n", vkd3d_queue);
+        if (exec->pacer_queues.command_queue)
+            pacer_queue_notify_submit_failed(exec->pacer_queues,
+                    exec->pacer_command_submit_id, exec->pacer_vulkan_submit_id);
         for (i = 0; i < exec->num_command_allocators; i++)
             d3d12_command_allocator_dec_ref(exec->command_allocators[i]);
         vkd3d_free(exec->command_allocators);
@@ -24686,9 +24864,13 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
             binary_semaphore_info->stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         }
 
-        cmd_injection = inject_pacer_timestamps(is_first, is_last, submit, cmd_count,
-            extended_cmds_stack, (cmd_count > 0) ? exec->cmd[cmd_index-1].deviceMask : 0,
-            command_queue->pacer_queues, exec );
+        memset(&cmd_injection, 0, sizeof(cmd_injection));
+        if (exec->pacer_queues.vulkan_queue)
+        {
+            cmd_injection = inject_pacer_timestamps(is_first, is_last, submit, cmd_count,
+                extended_cmds_stack, (cmd_count > 0) ? exec->cmd[cmd_index-1].deviceMask : 0,
+                exec->pacer_queues, exec );
+        }
 
         /* If we don't use serializing semaphore, we have to ensure that the last command buffer
          * in a submit is not a fallback submit. */
@@ -24753,6 +24935,10 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
             if (!(vk_queue = vkd3d_queue_acquire(vkd3d_queue)))
             {
                 ERR("Failed to acquire queue %p.\n", vkd3d_queue);
+                if (exec->pacer_queues.command_queue)
+                    pacer_queue_notify_submit_failed(exec->pacer_queues,
+                            exec->pacer_command_submit_id,
+                            exec->pacer_vulkan_submit_id);
                 return;
             }
         }
@@ -24785,6 +24971,8 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
         memset(&fence_info, 0, sizeof(fence_info));
         fence_info.vk_semaphore = vkd3d_queue->submission_timeline;
         fence_info.vk_semaphore_value = signal_semaphore_infos[0].value;
+        fence_info.submission_queue = vkd3d_queue;
+        fence_info.pacer_queues = exec->pacer_queues;
         fence_info.pacer_command_submit_id = exec->pacer_command_submit_id;
         fence_info.pacer_vulkan_submit_id = exec->pacer_vulkan_submit_id;
         fence_info.pacer_query_pool = query_pool;
@@ -24800,18 +24988,28 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
         if (FAILED(hr = vkd3d_enqueue_timeline_semaphore(&command_queue->fence_worker, &fence_info, &exec->timeline_cookie)))
         {
             ERR("Failed to enqueue timeline semaphore.\n");
-            if (query_pool)
-            {
-                // might trigger an out-of-order return log error, should be harmless
-                pacer_vulkan_queue_free_query_pool( command_queue->pacer_queues.vulkan_queue, query_pool );
-            }
+            if (exec->pacer_queues.command_queue)
+                pacer_queue_notify_submit_failed(exec->pacer_queues,
+                        exec->pacer_command_submit_id,
+                        exec->pacer_vulkan_submit_id);
+            /* The Vulkan submit may still reference this pool. Without a fence
+             * callback there is no safe point at which to recycle it. */
+            query_pool = NULL;
         }
+    }
+    else if (exec->pacer_queues.command_queue)
+    {
+        if (vr != VK_SUCCESS && query_pool)
+            pacer_vulkan_queue_free_query_pool(exec->pacer_queues.vulkan_queue, query_pool);
+        pacer_queue_notify_submit_failed(exec->pacer_queues,
+                exec->pacer_command_submit_id,
+                exec->pacer_vulkan_submit_id);
     }
 
     if (query_pool_top_of_pipe)
     {
         pacer_vulkan_queue_push_query_pool_top_of_pipe(
-            command_queue->pacer_queues.vulkan_queue,
+            exec->pacer_queues.vulkan_queue,
             query_pool_top_of_pipe,
             exec->pacer_vulkan_submit_id,
             vr == VK_SUCCESS && SUCCEEDED(hr));
@@ -25232,6 +25430,7 @@ static void d3d12_command_queue_flush_bind_sparse(struct d3d12_command_queue *co
     memset(&fence_info, 0, sizeof(fence_info));
     fence_info.vk_semaphore = queue->submission_timeline;
     fence_info.vk_semaphore_value = queue->submission_timeline_count;
+    fence_info.submission_queue = queue;
 
     resource_info = vkd3d_waiting_fence_set_callback(&fence_info,
             &vkd3d_waiting_fence_release_sparse_resources, sizeof(*resource_info));
@@ -25571,6 +25770,20 @@ static HRESULT d3d12_command_queue_init(struct d3d12_command_queue *queue,
         goto fail_pthread_cond;
     }
 
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    if ((rc = pthread_mutex_init(&queue->test_queue_transition_hook_mutex, NULL)))
+    {
+        hr = hresult_from_errno(rc);
+        goto fail_test_hook_mutex;
+    }
+
+    if ((rc = pthread_cond_init(&queue->test_queue_transition_hook_cond, NULL)))
+    {
+        hr = hresult_from_errno(rc);
+        goto fail_test_hook_cond;
+    }
+#endif
+
     if (desc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME)
         FIXME("Global realtime priority is not implemented.\n");
     if (desc->Priority)
@@ -25617,9 +25830,15 @@ fail_fence_worker_start:;
 fail_swapchain_factory:
     vkd3d_private_store_destroy(&queue->private_store);
 fail_private_store:
-    pthread_cond_destroy(&queue->queue_cond);
 fail_create_semaphore:
     VK_CALL(vkDestroySemaphore(device->vk_device, queue->serializing_semaphore, NULL));
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    pthread_cond_destroy(&queue->test_queue_transition_hook_cond);
+fail_test_hook_cond:
+    pthread_mutex_destroy(&queue->test_queue_transition_hook_mutex);
+fail_test_hook_mutex:
+#endif
+    pthread_cond_destroy(&queue->queue_cond);
 fail_pthread_cond:
     pthread_mutex_destroy(&queue->queue_lock);
 fail:
@@ -25748,7 +25967,8 @@ void vkd3d_enqueue_initial_transition(ID3D12CommandQueue *queue, ID3D12Resource 
 
     memset(&sub, 0, sizeof(sub));
     sub.type = VKD3D_SUBMISSION_EXECUTE;
-    sub.execute.low_latency_frame_id = d3d12_queue->device->frame_markers.render;
+    /* Initial-transition work is not an application render publication. */
+    sub.execute.low_latency_frame_id = 0;
     sub.execute.transition_count = 1;
     sub.execute.transitions = vkd3d_malloc(sizeof(*sub.execute.transitions));
     sub.execute.transitions[0].type = VKD3D_INITIAL_TRANSITION_TYPE_RESOURCE;

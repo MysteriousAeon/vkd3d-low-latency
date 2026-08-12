@@ -14,19 +14,18 @@ namespace pacer {
 
     Device::Device( pacer_device_properties* properties, const pacer_device_vk_procs* vkProcs )
     : m_properties(*properties), m_vkProcs(*vkProcs), m_calibratedDeviceTimestamps(this) {
-        m_pacer = new FramePacer(this, 2);
-        m_nvApi_pacingAdapter = new NvApi_PacingAdapter(this);
+        m_pacer = std::make_unique<FramePacer>(this, 2);
+        m_nvApi_pacingAdapter = std::make_unique<NvApi_PacingAdapter>(this);
         if (VKD3D_CONFIG_FLAG_IS_SET(PACER_DEBUG))
             enableLog = true;
     }
 
     Device::~Device( ) {
+        m_pacer->m_waitableDxgiSwapchain.stop();
         for (CommandQueue* commandQueue : m_commandQueues)
             delete commandQueue;
         for (VulkanQueue* vulkanQueue : m_vulkanQueues)
             delete vulkanQueue;
-        delete m_nvApi_pacingAdapter;
-        delete m_pacer;
     }
 
     pacer_queues Device::registerQueues( void* vkd3d_command_queue,

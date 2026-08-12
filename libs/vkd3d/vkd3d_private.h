@@ -45,6 +45,9 @@
 #include "config_flags.h"
 #include "copy_utils.h"
 #include "framepacer/framepacer_bridge.h"
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+#include "vkd3d_test_hooks.h"
+#endif
 #include <assert.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -272,6 +275,10 @@ struct vkd3d_fence_wait_info
 {
     VkSemaphore vk_semaphore;
     uint64_t vk_semaphore_value;
+    /* Borrowed from the device. vkd3d_queue objects outlive all fence-worker
+     * records because the worker is stopped before its device is released. */
+    struct vkd3d_queue *submission_queue;
+    struct pacer_queues pacer_queues;
     uint64_t pacer_command_submit_id;
     uint64_t pacer_vulkan_submit_id;
     struct pacer_query_pool* pacer_query_pool;
@@ -3739,6 +3746,7 @@ struct d3d12_command_queue_submission_execute
     struct d3d12_command_allocator **command_allocators;
     UINT cmd_count;
     UINT num_command_allocators;
+    struct pacer_queues pacer_queues;
     uint64_t pacer_command_submit_id;
     uint64_t pacer_vulkan_submit_id;
     uint64_t low_latency_frame_id;
@@ -3848,6 +3856,13 @@ struct d3d12_command_queue
 
     struct vkd3d_queue *vkd3d_queue;
     struct pacer_queues pacer_queues;
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    struct vkd3d_test_queue_transition_hook test_queue_transition_hook;
+    pthread_mutex_t test_queue_transition_hook_mutex;
+    pthread_cond_t test_queue_transition_hook_cond;
+    unsigned int test_queue_transition_hook_in_flight;
+    bool test_queue_transition_hook_updating;
+#endif
 
     struct d3d12_device *device;
 
@@ -3914,6 +3929,10 @@ void d3d12_command_queue_signal_inline(struct d3d12_command_queue *queue, d3d12_
 void d3d12_command_queue_enqueue_callback(struct d3d12_command_queue *queue, void (*callback)(void *), void *userdata);
 void d3d12_command_queue_add_submission_locked(struct d3d12_command_queue *queue,
                                                const struct d3d12_command_queue_submission *sub);
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+void d3d12_command_queue_test_transition_hook(struct d3d12_command_queue *queue,
+        enum vkd3d_test_queue_transition_hook_point point);
+#endif
 
 struct vkd3d_execute_indirect_info
 {

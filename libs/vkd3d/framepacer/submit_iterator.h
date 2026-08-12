@@ -16,14 +16,13 @@ namespace pacer {
         : m_commandQueue(q), m_vulkanQueue(q->m_vulkanQueue) {
             // we may be able to make this faster with caching, but let's first care about correctness
             // also because this is not called from a performance critical thread
-            auto q_submits = &q->m_submits;
-            auto c_submit = [q_submits]( uint64_t id ) {
-                return (*q_submits)[ id % CommandQueue::NUM_SUBMITS ].load(std::memory_order_acquire);
+            auto c_submit = [q]( uint64_t id ) {
+                CommandQueue::SlotSnapshot snapshot;
+                return q->snapshotSlot(id, &snapshot) ? snapshot.submit : time_point{};
             };
 
-            m_lastIndex = q->m_submitCounter - 1;
-            if (q->m_submitCounter == 0)
-                m_lastIndex = 0;
+            uint64_t submitCounter = q->m_submitCounter.load(std::memory_order_acquire);
+            m_lastIndex = submitCounter ? submitCounter - 1 : 0;
 
             uint64_t stopIndex = (m_lastIndex > CommandQueue::NUM_SUBMITS/2)
                 ? m_lastIndex - CommandQueue::NUM_SUBMITS/2 : 0;
@@ -41,6 +40,18 @@ namespace pacer {
             _INFO( "iter spans from %" PRIu64 " to %" PRIu64 "\n", m_curIndex, m_lastIndex );
         }
 
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        explicit SubmitIterator(CommandQueue* q, uint64_t commandId)
+        : m_curIndex(commandId), m_lastIndex(commandId),
+          m_commandQueue(q), m_vulkanQueue(q->m_vulkanQueue) {
+            cacheVulkanQueueId();
+        }
+
+        uint64_t testCachedVulkanSubmitId() const {
+            return m_cachedVulkanQueueId;
+        }
+#endif
+
         bool isAtEnd() {
             return m_curIndex > m_lastIndex;
         }
@@ -53,24 +64,31 @@ namespace pacer {
         void cacheVulkanQueueId() {
             if (isAtEnd())
                 return;
-            uint64_t vulkanId = m_commandQueue->m_vulkanQueueIds[ m_curIndex % CommandQueue::NUM_SUBMITS ].load(std::memory_order_acquire);
-            m_cachedVulkanQueueId = vulkanId % VulkanQueue::NUM_SUBMITS;
+            CommandQueue::SlotSnapshot snapshot;
+            if (!m_commandQueue->snapshotSlot(m_curIndex, &snapshot)) {
+                m_cachedAppSubmit = {};
+                m_cachedVulkanQueueId = 0;
+                return;
+            }
+            m_cachedAppSubmit = snapshot.submit;
+            m_cachedVulkanQueueId = snapshot.vulkanId;
+            m_commandQueue->testHook(CommandQueue::TestHookPoint::IteratorAfterSnapshot);
         }
 
         time_point getAppSubmit() {
-            return m_commandQueue->m_submits[ m_curIndex % CommandQueue::NUM_SUBMITS ].load(std::memory_order_acquire);
+            return m_cachedAppSubmit;
         }
 
         time_point getVulkanSubmit() {
-            return m_vulkanQueue->m_submits[ m_cachedVulkanQueueId ];
+            return m_vulkanQueue->getSubmitTimestamp(m_cachedVulkanQueueId);
         }
 
         uint64_t getVulkanGpuExecutionStart() {
-            return m_vulkanQueue->m_gpuExecutionStart[ m_cachedVulkanQueueId ].load(std::memory_order_acquire);
+            return m_vulkanQueue->getGpuExecutionStart(m_cachedVulkanQueueId);
         }
 
         uint64_t getVulkanGpuExecutionEnd() {
-            return m_vulkanQueue->m_gpuExecutionEnd[ m_cachedVulkanQueueId ].load(std::memory_order_acquire);
+            return m_vulkanQueue->getGpuExecutionEnd(m_cachedVulkanQueueId);
         }
 
         uint16_t getVulkanQueueId() {
@@ -83,7 +101,8 @@ namespace pacer {
         uint64_t m_lastIndex;
         CommandQueue* m_commandQueue;
         VulkanQueue* m_vulkanQueue;
-        uint16_t m_cachedVulkanQueueId;
+        uint64_t m_cachedVulkanQueueId = 0;
+        time_point m_cachedAppSubmit = {};
     };
 
 }

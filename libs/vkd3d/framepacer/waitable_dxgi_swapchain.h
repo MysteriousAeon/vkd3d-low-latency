@@ -9,16 +9,33 @@ namespace pacer {
     public:
 
         WaitableDXGISwapchain( Device* device, LatencyMarkersStorage& latencyMarkers, FrameSync& frameSync,
-            std::function<void(uint64_t, dxvk::high_resolution_clock::time_point)> sleep )
-        : m_device(device), m_latencyMarkers(latencyMarkers), m_frameSync(frameSync), m_sleep(std::move(sleep)),
+            std::function<uint64_t()> getAccountingState,
+            std::function<bool(uint64_t, dxvk::high_resolution_clock::time_point, uint64_t)> sleep )
+        : m_device(device), m_latencyMarkers(latencyMarkers), m_frameSync(frameSync),
+          m_getAccountingState(std::move(getAccountingState)), m_sleep(std::move(sleep)),
           m_thread([this] { threadFunc(); }) { }
 
         ~WaitableDXGISwapchain() {
 
-            m_stopped.store(true);
-            m_signal.signal_one();
-            m_thread.join();
+            stop();
 
+        }
+
+        void stop() {
+
+            if (m_stopped.exchange(true, std::memory_order_acq_rel))
+                return;
+            m_signal.signal_one();
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+            m_testResume.signal_one();
+#endif
+            if (m_thread.joinable())
+                m_thread.join();
+
+        }
+
+        bool stopped() const {
+            return m_stopped.load(std::memory_order_acquire);
         }
 
         void releaseSemaphore( void* vkd3d_swapchain, int count ) {
@@ -29,9 +46,14 @@ namespace pacer {
 
         }
 
-        void sleep( void* vkd3d_swapchain ) {
+        void sleep( void* vkd3d_swapchain, uint64_t expectedAccountingState = 0 ) {
 
-            if (m_device->m_activeType != Device::WaitableDXGISwapchain) {
+            uint64_t accountingState = m_getAccountingState();
+            if (expectedAccountingState && accountingState != expectedAccountingState) {
+                releaseSemaphore( vkd3d_swapchain, 1 );
+                return;
+            }
+            if (accountingState & 1) {
                 releaseSemaphore( vkd3d_swapchain, 3 );
                 return;
             }
@@ -49,6 +71,10 @@ namespace pacer {
 
                 m_frameInfo.cpuId = m_frameSync.cpuFinished;
                 m_frameInfo.latencyEvent = latencyEvent;
+                m_frameInfo.accountingState = accountingState;
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+                m_frameInfo.testOnly = false;
+#endif
 
                 m_signal.signal_one();
 
@@ -79,6 +105,30 @@ namespace pacer {
 
         }
 
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        void testQueueTask(uint64_t accountingState, uint64_t cpuId) {
+            m_ready.wait();
+            m_testMarkerReads.store(0, std::memory_order_release);
+            m_testMarkerWrites.store(0, std::memory_order_release);
+            m_testRejectedTasks.store(0, std::memory_order_release);
+            m_frameInfo.cpuId = cpuId;
+            m_frameInfo.latencyEvent = nullptr;
+            m_frameInfo.accountingState = accountingState;
+            m_frameInfo.testOnly = true;
+            m_signal.signal_one();
+        }
+
+        void testWaitDequeued() { m_testDequeued.wait(); }
+        void testResumeTask() { m_testResume.signal_one(); }
+        void testWaitIdle() {
+            m_ready.wait();
+            m_ready.signal_one();
+        }
+        uint64_t testMarkerReads() const { return m_testMarkerReads.load(std::memory_order_acquire); }
+        uint64_t testMarkerWrites() const { return m_testMarkerWrites.load(std::memory_order_acquire); }
+        uint64_t testRejectedTasks() const { return m_testRejectedTasks.load(std::memory_order_acquire); }
+#endif
+
 
     private:
 
@@ -90,17 +140,44 @@ namespace pacer {
                 if (m_stopped.load(std::memory_order_acquire))
                     return;
 
-                vkd3d_native_sync_handle* latencyEvent = m_frameInfo.latencyEvent;
+                FrameInfo frameInfo = m_frameInfo;
+                vkd3d_native_sync_handle* latencyEvent = frameInfo.latencyEvent;
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+                if (frameInfo.testOnly) {
+                    m_testDequeued.signal_one();
+                    m_testResume.wait();
+                }
+#endif
 
-                uint64_t cpuId = m_frameInfo.cpuId;
+                /* Reject a dequeued task before touching generation-sensitive
+                 * marker or prediction state. The semaphore handoff below is
+                 * generation-neutral and keeps the single-task protocol live. */
+                if (m_getAccountingState() != frameInfo.accountingState) {
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+                    m_testRejectedTasks.fetch_add(1, std::memory_order_release);
+#endif
+                    if (latencyEvent)
+                        vkd3d_native_sync_handle_release(*latencyEvent, 1);
+                    m_ready.signal_one();
+                    continue;
+                }
+
+                uint64_t cpuId = frameInfo.cpuId;
                 uint64_t newId = cpuId + 1;
 
-                LatencyMarkers* m_new = m_latencyMarkers.getMarkers( newId );
-                LatencyMarkers* m_prev = m_latencyMarkers.getMarkers( cpuId-1 );
-                m_sleep( newId, m_prev->cpuFinished );
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+                m_testMarkerReads.fetch_add(1, std::memory_order_release);
+#endif
+                LatencyMarkers previous = m_latencyMarkers.getMarkers(
+                        frameInfo.accountingState, cpuId - 1);
+                bool generationValid = m_sleep(newId, previous.cpuFinished,
+                        frameInfo.accountingState);
 
                 bool usingWaitableSwapchain = true;
                 ++m_presentCounterWaitableObject;
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+                if (!frameInfo.testOnly) {
+#endif
                 if (WaitForSingleObject((*latencyEvent).handle, 0) == WAIT_OBJECT_0) {
                     usingWaitableSwapchain = false;
                     --m_presentCounterWaitableObject;
@@ -108,9 +185,20 @@ namespace pacer {
                 while (WaitForSingleObject((*latencyEvent).handle, 0) == WAIT_OBJECT_0)
                     { }
                 vkd3d_native_sync_handle_release(*latencyEvent, 1);
-                if (usingWaitableSwapchain) {
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+                }
+#endif
+                if (usingWaitableSwapchain && generationValid) {
                     _INFO( "setting m_new->start \n" );
-                    m_new->start = dxvk::high_resolution_clock::now();
+                    bool updated = m_latencyMarkers.updateMarkers(frameInfo.accountingState,
+                            newId, [&](LatencyMarkers& markers) {
+                        markers.start = dxvk::high_resolution_clock::now();
+                    });
+                    (void)updated;
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+                    if (updated)
+                        m_testMarkerWrites.fetch_add(1, std::memory_order_release);
+#endif
                 }
 
                 m_ready.signal_one();
@@ -123,11 +211,16 @@ namespace pacer {
         LatencyMarkersStorage& m_latencyMarkers;
         FrameSync& m_frameSync;
 
-        std::function<void(uint64_t, dxvk::high_resolution_clock::time_point)> m_sleep;
+        std::function<uint64_t()> m_getAccountingState;
+        std::function<bool(uint64_t, dxvk::high_resolution_clock::time_point, uint64_t)> m_sleep;
 
         struct FrameInfo {
             uint64_t cpuId;
             vkd3d_native_sync_handle* latencyEvent;
+            uint64_t accountingState;
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+            bool testOnly = false;
+#endif
         };
 
         FrameInfo m_frameInfo;
@@ -140,6 +233,14 @@ namespace pacer {
         uint64_t m_presentCounterPrint = { 32 };
 
         dxvk::thread m_thread;
+
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        sync::AtomicSignal m_testDequeued = { "dxgi::m_testDequeued", false };
+        sync::AtomicSignal m_testResume = { "dxgi::m_testResume", false };
+        std::atomic<uint64_t> m_testMarkerReads = { 0 };
+        std::atomic<uint64_t> m_testMarkerWrites = { 0 };
+        std::atomic<uint64_t> m_testRejectedTasks = { 0 };
+#endif
 
     };
 

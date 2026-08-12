@@ -46,15 +46,22 @@ namespace pacer {
 
         // we expect to handle one thread only here
         uint64_t notifySubmit( ) {
-
-            uint64_t id = m_submitCounter.load();
+            uint64_t id = m_submitCounter.fetch_add(1, std::memory_order_acq_rel);
             uint16_t index = id % NUM_SUBMITS;
-            m_submits[index] = high_resolution_clock::now();
-            m_gpuExecutionStart[index] = 0;
-            m_gpuExecutionEnd[index] = 0;
-            ++m_submitCounter;
-            return id;
+            time_point now = high_resolution_clock::now();
 
+            testHook(TestHookPoint::ProducerBeforeSlot);
+            {
+                std::lock_guard<dxvk::mutex> lock(m_slotMutexes[index]);
+                uint64_t previousGeneration = m_submitGenerations[index].load(
+                        std::memory_order_relaxed);
+                if (previousGeneration &&
+                        !m_submitAccounted[index].load(std::memory_order_relaxed))
+                    return 0;
+                resetSlotLocked(index, id, now);
+            }
+            testHook(TestHookPoint::ProducerAfterSlot);
+            return id;
         }
 
         uint64_t notifyGpuExecutionEnd( uint64_t vulkanId, pacer_query_pool* queryPool ) {
@@ -62,13 +69,51 @@ namespace pacer {
             if (queryPool == nullptr)
                 return 0;
 
-            uint64_t index = vulkanId % NUM_SUBMITS;
-            uint64_t timestamp;
-            getQueryPoolResult(queryPool, &timestamp);
-            m_gpuExecutionEnd[index].store( timestamp, std::memory_order_release );
+            uint16_t index = vulkanId % NUM_SUBMITS;
+            uint64_t timestamp = 0;
+            if (getQueryPoolResult(queryPool, &timestamp) != VK_SUCCESS)
+                timestamp = 0;
+            {
+                std::lock_guard<dxvk::mutex> lock(m_slotMutexes[index]);
+                if (m_submitGenerations[index].load(std::memory_order_relaxed) != vulkanId ||
+                        m_submitAccounted[index].load(std::memory_order_relaxed))
+                    timestamp = 0;
+                else
+                    m_gpuExecutionEnd[index].store(timestamp, std::memory_order_relaxed);
+            }
             freeQueryPool(queryPool);
             return timestamp;
 
+        }
+
+        void finishSubmit(uint64_t vulkanId) {
+            uint16_t index = vulkanId % NUM_SUBMITS;
+            testHook(TestHookPoint::FinishBeforeSlot);
+            {
+                std::lock_guard<dxvk::mutex> lock(m_slotMutexes[index]);
+                if (m_submitGenerations[index].load(std::memory_order_relaxed) == vulkanId)
+                    m_submitAccounted[index].store(true, std::memory_order_relaxed);
+            }
+            testHook(TestHookPoint::FinishAfterSlot);
+        }
+
+        void abandonSubmit(uint64_t vulkanId) {
+            finishSubmit(vulkanId);
+        }
+
+        uint64_t getGpuExecutionEnd(uint64_t vulkanId) const {
+            SlotSnapshot snapshot;
+            return snapshotSlot(vulkanId, &snapshot) ? snapshot.gpuExecutionEnd : 0;
+        }
+
+        time_point getSubmitTimestamp(uint64_t vulkanId) const {
+            SlotSnapshot snapshot;
+            return snapshotSlot(vulkanId, &snapshot) ? snapshot.submit : time_point{};
+        }
+
+        uint64_t getGpuExecutionStart(uint64_t vulkanId) const {
+            SlotSnapshot snapshot;
+            return snapshotSlot(vulkanId, &snapshot) ? snapshot.gpuExecutionStart : 0;
         }
 
         pacer_query_pool* allocQueryPool() {
@@ -106,7 +151,137 @@ namespace pacer {
 
         }
 
+        enum class TestHookPoint : uint32_t {
+            ProducerBeforeSlot,
+            ProducerAfterSlot,
+            FinishBeforeSlot,
+            FinishAfterSlot,
+            GetterBeforeSlot,
+        };
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        using TestHook = void (*)(uint32_t, void*);
+
+        void setTestHook(TestHook hook, void* userdata) {
+            std::unique_lock<dxvk::mutex> lock(m_testHookMutex);
+            m_testHook = nullptr;
+            m_testHookUserdata = nullptr;
+            m_testHookCond.notify_all();
+            m_testHookDrainWaiting = m_testHookInFlight != 0;
+            if (m_testHookDrainWaiting)
+                m_testHookCond.notify_all();
+            m_testHookCond.wait(lock, [this] { return m_testHookInFlight == 0; });
+            m_testHookDrainWaiting = false;
+            m_testHook = hook;
+            m_testHookUserdata = userdata;
+            m_testHookCond.notify_all();
+        }
+
+        void waitTestHookDrain() const {
+            std::unique_lock<dxvk::mutex> lock(m_testHookMutex);
+            m_testHookCond.wait(lock, [this] { return m_testHookDrainWaiting; });
+        }
+
+        void testSetSubmitTimestamp(uint64_t vulkanId, uint64_t timestamp) {
+            uint16_t index = vulkanId % NUM_SUBMITS;
+            std::lock_guard<dxvk::mutex> lock(m_slotMutexes[index]);
+            if (m_submitGenerations[index].load(std::memory_order_relaxed) == vulkanId)
+                m_submits[index].store(time_point(time_point::duration(timestamp)),
+                        std::memory_order_relaxed);
+        }
+
+        uint64_t testGpuExecutionEnd( uint64_t vulkanId ) const {
+            return getGpuExecutionEnd(vulkanId);
+        }
+
+        void testSetGpuExecutionStart(uint64_t vulkanId, uint64_t timestamp) {
+            publishGpuExecutionStart(vulkanId, timestamp);
+        }
+
+        void testSetGpuExecutionEnd(uint64_t vulkanId, uint64_t timestamp) {
+            uint16_t index = vulkanId % NUM_SUBMITS;
+            std::lock_guard<dxvk::mutex> lock(m_slotMutexes[index]);
+            if (m_submitGenerations[index].load(std::memory_order_relaxed) == vulkanId)
+                m_gpuExecutionEnd[index].store(timestamp, std::memory_order_relaxed);
+        }
+
+        bool testSlotState(uint64_t vulkanId, uint64_t* generation,
+                uint64_t* submitTimestamp, bool* hasSubmit, uint64_t* gpuExecutionStart,
+                uint64_t* gpuExecutionEnd, bool* accounted) const {
+            SlotSnapshot snapshot;
+            bool found = snapshotSlot(vulkanId, &snapshot);
+            *generation = snapshot.generation;
+            *submitTimestamp = snapshot.submit.time_since_epoch().count();
+            *hasSubmit = snapshot.submit != time_point{};
+            *gpuExecutionStart = snapshot.gpuExecutionStart;
+            *gpuExecutionEnd = snapshot.gpuExecutionEnd;
+            *accounted = snapshot.accounted;
+            return found;
+        }
+#endif
+
     private:
+
+        struct SlotSnapshot {
+            uint64_t generation = 0;
+            time_point submit = {};
+            uint64_t gpuExecutionStart = 0;
+            uint64_t gpuExecutionEnd = 0;
+            bool accounted = false;
+        };
+
+        void resetSlotLocked(uint16_t index, uint64_t id, time_point now) {
+            m_submits[index].store(now, std::memory_order_relaxed);
+            m_gpuExecutionStart[index].store(0, std::memory_order_relaxed);
+            m_gpuExecutionEnd[index].store(0, std::memory_order_relaxed);
+            m_submitAccounted[index].store(false, std::memory_order_relaxed);
+            m_submitGenerations[index].store(id, std::memory_order_relaxed);
+        }
+
+        bool snapshotSlot(uint64_t vulkanId, SlotSnapshot* snapshot) const {
+            if (!vulkanId)
+                return false;
+            uint16_t index = vulkanId % NUM_SUBMITS;
+            testHook(TestHookPoint::GetterBeforeSlot);
+            std::lock_guard<dxvk::mutex> lock(m_slotMutexes[index]);
+            snapshot->generation = m_submitGenerations[index].load(std::memory_order_relaxed);
+            if (snapshot->generation != vulkanId)
+                return false;
+            snapshot->submit = m_submits[index].load(std::memory_order_relaxed);
+            snapshot->gpuExecutionStart = m_gpuExecutionStart[index].load(std::memory_order_relaxed);
+            snapshot->gpuExecutionEnd = m_gpuExecutionEnd[index].load(std::memory_order_relaxed);
+            snapshot->accounted = m_submitAccounted[index].load(std::memory_order_relaxed);
+            return true;
+        }
+
+        void publishGpuExecutionStart(uint64_t vulkanId, uint64_t timestamp) {
+            uint16_t index = vulkanId % NUM_SUBMITS;
+            std::lock_guard<dxvk::mutex> lock(m_slotMutexes[index]);
+            if (m_submitGenerations[index].load(std::memory_order_relaxed) == vulkanId &&
+                    !m_submitAccounted[index].load(std::memory_order_relaxed))
+                m_gpuExecutionStart[index].store(timestamp, std::memory_order_relaxed);
+        }
+
+        void testHook(TestHookPoint point) const {
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+            TestHook hook;
+            void* userdata;
+            {
+                std::lock_guard<dxvk::mutex> lock(m_testHookMutex);
+                hook = m_testHook;
+                userdata = m_testHookUserdata;
+                if (hook)
+                    ++m_testHookInFlight;
+            }
+            if (!hook)
+                return;
+            hook(static_cast<uint32_t>(point), userdata);
+            {
+                std::lock_guard<dxvk::mutex> lock(m_testHookMutex);
+                if (!--m_testHookInFlight)
+                    m_testHookCond.notify_all();
+            }
+#endif
+        }
 
         void freeQueryPoolTopOfPipe(pacer_query_pool* queryPool) {
 
@@ -281,7 +456,7 @@ namespace pacer {
                 assert( item.queryPool );
                 uint64_t gpuTimestamp;
                 getQueryPoolResult( item.queryPool, &gpuTimestamp );
-                m_gpuExecutionStart[ item.submitId % NUM_SUBMITS ].store(gpuTimestamp);
+                publishGpuExecutionStart(item.submitId, gpuTimestamp);
                 freeQueryPoolTopOfPipe( item.queryPool );
 
             }
@@ -292,10 +467,22 @@ namespace pacer {
         Device* m_device;
 
         // is accessed from multiple threads
-        std::array<time_point, NUM_SUBMITS> m_submits = { };
+        std::array<std::atomic<time_point>, NUM_SUBMITS> m_submits = { };
         std::array<std::atomic<uint64_t>, NUM_SUBMITS> m_gpuExecutionStart = { };
         std::array<std::atomic<uint64_t>, NUM_SUBMITS> m_gpuExecutionEnd = { };
+        std::array<std::atomic<uint64_t>, NUM_SUBMITS> m_submitGenerations = { };
+        std::array<std::atomic<bool>, NUM_SUBMITS> m_submitAccounted = { };
+        mutable std::array<dxvk::mutex, NUM_SUBMITS> m_slotMutexes;
         std::atomic<uint64_t> m_submitCounter = { 1 };
+
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        mutable dxvk::mutex m_testHookMutex;
+        mutable dxvk::condition_variable m_testHookCond;
+        mutable TestHook m_testHook = nullptr;
+        mutable void* m_testHookUserdata = nullptr;
+        mutable uint32_t m_testHookInFlight = 0;
+        mutable bool m_testHookDrainWaiting = false;
+#endif
 
         // holding the elements in a lockfree ringbuffer has the advantage
         // that we can check if we truely cycle through the pools in order

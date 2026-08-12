@@ -7,10 +7,15 @@
 #include "frame_mapping.h"
 #include "waitable_dxgi_swapchain.h"
 #include "latency_markers.h"
+#include "simulation_ledger.h"
 #include "latency_stats.h"
 #include "jitter_stats.h"
 #include "util/sync/sync_ringbuffer_allocator.h"
 #include "util/util_log.h"
+#include <unordered_map>
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+#include "vkd3d_test_hooks.h"
+#endif
 
 
 /* \brief Frame pacer interface managing the CPU - GPU synchronization.
@@ -37,6 +42,8 @@ namespace pacer {
 
         struct FrameInfo {
             uint64_t externalId;
+            uint64_t simulationId;
+            uint64_t accountingEpoch;
             time_point start_t;
             int32_t renderStart;
             int32_t renderEnd;
@@ -45,57 +52,112 @@ namespace pacer {
         FramePacer( Device* device, uint64_t firstFrameId );
         ~FramePacer();
 
-        void sleep( uint64_t frameId, time_point lastSimulationStart ) {
+        bool sleep( uint64_t frameId, time_point lastSimulationStart,
+                uint64_t expectedAccountingState = 0 ) {
+            uint64_t accountingState = expectedAccountingState
+                    ? expectedAccountingState : getAccountingState();
+            if (getAccountingState() != accountingState)
+                return false;
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+            m_testSleepDecision.call_count++;
+            m_testSleepEntryCount.fetch_add(1, std::memory_order_release);
+            m_testSleepDecision.entry_accounting_state = accountingState;
+            m_testSleepDecision.exit_accounting_state = accountingState;
+            m_testSleepDecision.frame_id = frameId;
+            m_testSleepDecision.cpu_finished = m_frameSync.cpuFinished.load();
+            m_testSleepDecision.gpu_finished = m_frameSync.gpuFinished.load();
+            m_testSleepDecision.would_start_frame = false;
+#endif
             _INFO( "sleep - frameId: %" PRIu64 ", m_frameSync.cpuFinished: %"
                 PRIu64 " m_frameSync.gpuFinished: %" PRIu64 " \n",
                 frameId, m_frameSync.cpuFinished.load(), m_frameSync.gpuFinished.load() );
 
+            if (isReflexAccountingState(accountingState)
+                    && m_simulationLedger.shouldBypassPacing()) {
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+                m_testSleepDecision.exit_accounting_state = getAccountingState();
+#endif
+                _WARN( "bypassing Reflex pacing after simulation tracking failure\n" );
+                return true;
+            }
+
             // wait for finished rendering of a previous frame, typically the one before last
             uint64_t waitId = frameId-m_frameSync.m_waitLatency;
-            if (!m_frameSync.gpuFinished.wait(waitId, 200)) {
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+            m_testSleepDecision.wait_id = waitId;
+            m_testSleepDecision.wait_satisfied =
+                    m_testSleepDecision.gpu_finished >= waitId;
+            if (m_testSleepBypass) {
+                std::lock_guard<dxvk::mutex> progressLock(m_progressMutex);
+                if (getAccountingState() != accountingState)
+                    return false;
+                m_testSleepDecision.exit_accounting_state = getAccountingState();
+                m_testSleepDecision.would_start_frame = m_testSleepDecision.wait_satisfied;
+                return true;
+            }
+#endif
+            if (!m_frameSync.gpuFinished.wait(waitId, 200,
+                    m_accountingState, accountingState)) {
+                if (getAccountingState() != accountingState) {
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+                    m_testSleepDecision.exit_accounting_state = getAccountingState();
+#endif
+                    return false;
+                }
                 WARN( "timeout on waiting for gpu finish id %" PRIu64 " reached, resulting in stutter \n", waitId );
-                return;
+                return true;
             }
             // potentially wait some more if the cpu gets too much ahead
-            m_mode->startFrame(frameId, lastSimulationStart);
+            std::lock_guard<dxvk::mutex> progressLock(m_progressMutex);
+            if (getAccountingState() != accountingState)
+                return false;
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+            m_testSleepDecision.exit_accounting_state = getAccountingState();
+            m_testSleepDecision.wait_satisfied = true;
+#endif
+            m_mode->startFrame(accountingState, frameId, lastSimulationStart);
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+            m_testSleepDecision.would_start_frame = true;
+#endif
+            return true;
         }
 
-        int64_t registerExternalId( uint64_t externalId, const FrameInfo& frameInfo ) {
-            uint64_t cpuId = m_frameSync.cpuFinished + 1;
-
-            uint64_t id = m_frameMapping.getFrameId(cpuId);
-            if (id && id != externalId) {
-                ERR( "Application reports different external-ids mapped to the same internal id %" PRIu64 "\n",
-                    cpuId );
-                return std::numeric_limits<int64_t>::max();
-            }
-
-            if (!id) {
-                m_frameMapping.registerMapping( cpuId, externalId );
-                LatencyMarkers* m = m_latencyMarkers.getMarkers(cpuId);
-                m->start = frameInfo.start_t;
-                m->renderStart = frameInfo.renderStart;
-                m->renderEnd = frameInfo.renderEnd;
-            }
-
-            return cpuId - externalId;
+        template<typename Commit>
+        bool withValidAccountingState(uint64_t accountingEpoch, Commit&& commit) {
+            std::lock_guard<dxvk::mutex> progressLock(m_progressMutex);
+            if (m_accountingState.load(std::memory_order_acquire) != accountingEpoch ||
+                    !isReflexAccountingState(accountingEpoch))
+                return false;
+            commit();
+            return true;
         }
 
-        void finishCpu() {
+        bool finishCpu(uint64_t accountingEpoch) {
+            std::lock_guard<dxvk::mutex> progressLock(m_progressMutex);
+            if (m_accountingState.load(std::memory_order_acquire) != accountingEpoch ||
+                    isReflexAccountingState(accountingEpoch))
+                return false;
             uint64_t cpuId = 1 + m_frameSync.cpuFinished++;
 
             uint64_t newId = cpuId + 1;
-            m_frameMapping.registerMapping( newId, 0 );
-            LatencyMarkers* m = m_latencyMarkers.getMarkers( cpuId );
-            LatencyMarkers* m_next = m_latencyMarkers.getMarkers( newId+1 );
-            *m_next = LatencyMarkers {};
+            m_frameMapping.registerMapping(accountingEpoch, newId, 0);
+            m_latencyMarkers.updateMarkers(accountingEpoch, newId + 1,
+                    [](LatencyMarkers&) {});
 
             _INFO( "reset markers for frame %" PRIu64 " \n", newId+1 );
 
-            m->cpuFinished = high_resolution_clock::now();
+            m_latencyMarkers.updateMarkers(accountingEpoch, cpuId,
+                    [&](LatencyMarkers& markers) {
+                markers.cpuFinished = high_resolution_clock::now();
+            });
+            return true;
         }
 
-        void finishRender( uint64_t gpuDeviceTimestamp ) {
+        void finishRender(uint64_t gpuDeviceTimestamp, uint64_t accountingEpoch) {
+            std::lock_guard<dxvk::mutex> progressLock(m_progressMutex);
+            if (m_accountingState.load(std::memory_order_acquire) != accountingEpoch ||
+                    isReflexAccountingState(accountingEpoch))
+                return;
             // this is incredibly rare that finish render is triggered
             // for two consecutive frames from two threads simultaneously
             // but we've had that happen when logging was enabled
@@ -103,37 +165,69 @@ namespace pacer {
             m_device->m_calibratedDeviceTimestamps.calibrate();
 
             uint64_t gpuId = 1 + m_frameSync.gpuFinished;
-            LatencyMarkers* m = m_latencyMarkers.getMarkers( gpuId );
-
             time_point t = m_device->m_calibratedDeviceTimestamps.getHostTimestamp(gpuDeviceTimestamp);
-            m->gpuFinished = t;
+            m_latencyMarkers.updateMarkers(accountingEpoch, gpuId,
+                    [&](LatencyMarkers& markers) { markers.gpuFinished = t; });
 
             m_frameSync.gpuFinished++;
 
             _INFO( "set gpuFinished to %" PRIu64 " \n", m_frameSync.gpuFinished.load() );
 
-            if (m_device->m_activeType == Device::NVIDIA_Reflex) {
-                uint64_t frameId = m_frameMapping.getFrameId( gpuId );
-                if (frameId == 0) {
-                    _WARN( "frame with gpuId %" PRIu64 " not tracked correctly, ignoring. Missing marker? \n", gpuId );
-                    return;
-                }
-            }
-
-            if (m->start == time_point{}) {
+            LatencyMarkers markers = m_latencyMarkers.getMarkers(accountingEpoch, gpuId);
+            if (markers.start == time_point{}) {
                 _INFO( "m->start not set, skipping frame analysis \n" );
                 return;
             }
 
-            int32_t latency = std::chrono::duration_cast<microseconds> ( t - m->start ).count();
+            int32_t latency = std::chrono::duration_cast<microseconds> ( t - markers.start ).count();
             _INFO( "latency = %" PRIi32 "\n", latency );
 //            auto now = high_resolution_clock::now();
 //            int32_t t_vs_now = std::chrono::duration_cast<microseconds> ( t - now ).count();
 //            INFO( "t_vs_now = %" PRIi32 "\n", t_vs_now );
 //            INFO( "t = %" PRIu64 " \n", gpuDeviceTimestamp );
 //            m_latencyAverage.push( m->gpuFinished );
-            m_mode->finishRender( gpuId );
+            m_mode->finishRender(accountingEpoch, gpuId);
         }
+
+        void setReflexMode(bool enable);
+        uint64_t getAccountingState() const {
+            return m_accountingState.load(std::memory_order_acquire);
+        }
+        uint64_t getReflexEpoch() const {
+            uint64_t state = getAccountingState();
+            return isReflexAccountingState(state) ? state : 0;
+        }
+        static bool isReflexAccountingState(uint64_t state) {
+            return state & 1;
+        }
+
+        uint64_t beginReflexSimulation(uint64_t accountingEpoch,
+                uint64_t externalReflexId, uint32_t threadId, time_point start);
+        void beginReflexRenderSubmit(uint64_t accountingEpoch,
+                uint64_t externalReflexId, uint32_t threadId,
+                int32_t renderStart);
+        void endReflexRenderSubmit(uint64_t accountingEpoch,
+                uint64_t externalReflexId, uint32_t threadId,
+                int32_t renderEnd);
+        PresentAttemptToken beginReflexPresent(uint64_t accountingEpoch,
+                uint64_t simulationId, uint32_t threadId,
+                const FrameInfo& frameInfo);
+        void endReflexPresent(uint64_t accountingEpoch,
+                uint64_t simulationId, uint32_t threadId);
+        PresentAttemptToken capturePresentAttempt();
+        bool notifyReflexPresent(const PresentAttemptToken& attemptToken,
+                void* swapchain, uint64_t sequence);
+        void cancelReflexPresent(const PresentAttemptToken& attemptToken);
+        void forceReflexPacingBypass();
+        void accountReflexCompletion(SubmitRecord& submit, void* commandQueue,
+                uint64_t commandGeneration, void* vulkanQueue,
+                uint64_t vulkanGeneration, uint64_t gpuTimestamp);
+        void abandonReflexSubmit(SubmitRecord& submit, void* commandQueue,
+                uint64_t commandGeneration, void* vulkanQueue,
+                uint64_t vulkanGeneration);
+        void retireCaptureLease(const CaptureToken& token,
+                CaptureRetireReason reason);
+        void applySimulationProgress(SimulationProgress&& progress);
 
         // todo: implement
         void notifyGpuPresentEnd( uint64_t frameId ) {
@@ -152,6 +246,20 @@ namespace pacer {
         FramePacerMode* getFramePacerMode() {
             return m_mode.get();
         }
+
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        void testSetPrediction(uint64_t frameId, int32_t optimizedGpuTime) {
+            std::lock_guard<dxvk::mutex> progressLock(m_progressMutex);
+            m_mode->testSetPrediction(frameId, optimizedGpuTime);
+        }
+
+        void testGetPredictionState(vkd3d_test_prediction_state *state) {
+            std::lock_guard<dxvk::mutex> progressLock(m_progressMutex);
+            state->accounting_state = getAccountingState();
+            state->finished_frame_id = m_mode->testGetPredictionFrame();
+            state->predicted_gpu_time = m_mode->testGetPredictionGpuTime();
+        }
+#endif
 
         void setFpsLimit( uint32_t minInterval ) {
             m_mode->setFpsLimit(minInterval);
@@ -181,9 +289,13 @@ namespace pacer {
 
         void trackStats( uint64_t frameId ) {
             using std::chrono::duration_cast;
-            const LatencyMarkers* m_prev2 = m_latencyMarkers.getConstMarkers(frameId-2);
-            const LatencyMarkers* m_prev = m_latencyMarkers.getConstMarkers(frameId-1);
-            const LatencyMarkers* m = m_latencyMarkers.getConstMarkers(frameId);
+            uint64_t generation = getAccountingState();
+            LatencyMarkers markersPrev2 = m_latencyMarkers.getMarkers(generation, frameId-2);
+            LatencyMarkers markersPrev = m_latencyMarkers.getMarkers(generation, frameId-1);
+            LatencyMarkers markers = m_latencyMarkers.getMarkers(generation, frameId);
+            const LatencyMarkers* m_prev2 = &markersPrev2;
+            const LatencyMarkers* m_prev = &markersPrev;
+            const LatencyMarkers* m = &markers;
 
             if (m_enabledJitterTracking && frameId > m_mode->getFirstFrameId()+2) {
                 JitterEntry e;
@@ -233,13 +345,25 @@ namespace pacer {
     public:
 
         LatencyMarkersStorage m_latencyMarkers;
-        FrameMapping m_frameMapping;
+        FrameMapping m_frameMapping { 2 };
         FrameSync m_frameSync;
+        SimulationLedger m_simulationLedger;
         WaitableDXGISwapchain m_waitableDxgiSwapchain;
+
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        bool m_testSleepBypass = false;
+        vkd3d_test_latency_sleep_decision m_testSleepDecision = {};
+        std::atomic<uint64_t> m_testSleepEntryCount = { 0 };
+#endif
 
     private:
 
         dxvk::mutex m_finishMutex;
+        dxvk::mutex m_progressMutex;
+        std::atomic<uint64_t> m_accountingState = { 2 };
+        std::atomic<uint64_t> m_nextLegacyPresentAttempt = { 1 };
+        std::unordered_map<uint32_t, PresentAttemptToken> m_uncapturedPresentAttempts;
+        const uint64_t m_firstFrameId;
 
         std::atomic<LatencyStats*> m_gpuBufferStats = { nullptr };
         std::atomic<LatencyStats*> m_presentationStats = { nullptr };
