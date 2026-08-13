@@ -149,6 +149,23 @@ private:
 };
 
 void initialize(uint32_t waitLatency) noexcept;
+/* A FramePacer keeps one of these only while its telemetry-bearing work can
+ * still publish. Releasing the last owner is the clean-device fallback. */
+class Owner {
+public:
+    Owner() = default;
+    ~Owner();
+    Owner(const Owner&) = delete;
+    Owner& operator=(const Owner&) = delete;
+    Owner(Owner&& other) noexcept;
+    Owner& operator=(Owner&& other) noexcept;
+    bool acquire() noexcept;
+    void release() noexcept;
+    bool acquired() const { return m_acquired; }
+private:
+    bool m_acquired = false;
+};
+
 void shutdown();
 bool isEnabled();
 bool emit(Event event);
@@ -176,6 +193,13 @@ void testResumeInitialization();
 void testWaitGlobalWriterFailed();
 bool testInitializationComplete();
 uint32_t testInitializerEntryCount();
+void testProcessExitFinalizer();
+uint32_t testOwnerCount();
+bool testFinalized();
+void testArmFinalizationPause();
+void testWaitFinalizationPaused();
+void testResumeFinalization();
+void testWaitForFinalizationWaiter();
 #endif
 
 } // namespace pacer::telemetry

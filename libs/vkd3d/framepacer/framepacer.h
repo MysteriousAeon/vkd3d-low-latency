@@ -437,6 +437,7 @@ namespace pacer {
         FrameMapping m_frameMapping { 2 };
         FrameSync m_frameSync;
         SimulationLedger m_simulationLedger;
+        telemetry::Owner m_telemetryOwner;
         WaitableDXGISwapchain m_waitableDxgiSwapchain;
 
 #ifdef VKD3D_ENABLE_TEST_HOOKS

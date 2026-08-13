@@ -43,6 +43,12 @@ static std::vector<std::string> readLines(const std::string& path) {
     return lines;
 }
 
+static unsigned countSummary(const std::vector<std::string>& lines) {
+    return std::count_if(lines.begin(), lines.end(), [](const std::string& line) {
+        return line.find("\"record_type\":\"SUMMARY\"") != std::string::npos;
+    });
+}
+
 static uint64_t sequenceOf(const std::string& line) {
     const std::string key = "\"event_sequence\":";
     size_t position = line.find(key);
@@ -387,6 +393,127 @@ static void testConcurrentInitializationAndIds() {
     testReset();
 }
 
+static void testOwnerLifecycle() {
+    std::string path = tempPath("vkd3d-telemetry-owner-lifecycle.jsonl");
+    std::remove(path.c_str());
+    check(testInitialize(path, 3, 64), "owner lifecycle initialization failed");
+    Owner ownerA, ownerB;
+    check(ownerA.acquire() && ownerB.acquire() && testOwnerCount() == 2,
+            "two live FramePacer owners were not recorded");
+    check(emit({}), "first owner telemetry publication failed");
+    ownerA.release();
+    check(isEnabled() && testOwnerCount() == 1,
+            "releasing one of two owners finalized telemetry");
+    check(emit({}), "second owner could not publish after first owner release");
+    ownerB.release();
+    check(testFinalized() && !isEnabled(), "final owner did not permanently finalize telemetry");
+    auto lines = readLines(path);
+    check(countSummary(lines) == 1 && !lines.empty() &&
+            lines.back().find("\"record_type\":\"SUMMARY\"") != std::string::npos,
+            "final owner did not leave exactly one terminal SUMMARY");
+    Owner later;
+    check(!later.acquire(), "telemetry reopened after final owner shutdown");
+    check(readLines(path).size() == lines.size(), "later owner reopened or truncated telemetry output");
+    shutdown();
+    check(countSummary(readLines(path)) == 1, "module fallback produced a second SUMMARY");
+    testReset();
+}
+
+static void testProcessFinalizerWithLiveOwners() {
+    std::string path = tempPath("vkd3d-telemetry-process-finalizer.jsonl");
+    std::remove(path.c_str());
+    check(testInitialize(path, 3, 8, true), "process-finalizer initialization failed");
+    Owner ownerA, ownerB;
+    check(ownerA.acquire() && ownerB.acquire(), "live owners failed to acquire telemetry");
+    testArmProducerPause(ProducerPausePoint::GlobalAcquired);
+    std::atomic<bool> finalized = {false};
+    std::thread producer([] { check(emit({}), "admitted producer was rejected by process finalizer"); });
+    testWaitProducerPaused();
+    std::thread finalizer([&] {
+        testProcessExitFinalizer();
+        finalized.store(true, std::memory_order_release);
+    });
+    while (!testGlobalClosing()) std::this_thread::yield();
+    check(!finalized.load(std::memory_order_acquire),
+            "process finalizer bypassed an admitted producer");
+    testResumeProducer();
+    producer.join();
+    finalizer.join();
+    check(testFinalized(), "process callback did not permanently finalize telemetry");
+    check(countSummary(readLines(path)) == 1, "process callback did not produce one SUMMARY");
+    ownerA.release();
+    ownerB.release();
+    shutdown();
+    check(countSummary(readLines(path)) == 1,
+            "owner or module fallback repeated process callback finalization");
+    testReset();
+}
+
+static void testProcessFinalizerOwnerRace() {
+    std::string path = tempPath("vkd3d-telemetry-finalizer-owner-race.jsonl");
+    std::remove(path.c_str());
+    check(testInitialize(path, 3, 64), "finalizer race initialization failed");
+    Owner owner;
+    check(owner.acquire(), "race owner acquisition failed");
+    testArmFinalizationPause();
+    std::atomic<bool> processReturned = {false};
+    std::thread lastOwner([&] { owner.release(); });
+    testWaitFinalizationPaused();
+    std::thread processFinalizer([&] {
+        testProcessExitFinalizer();
+        processReturned.store(true, std::memory_order_release);
+    });
+    testWaitForFinalizationWaiter();
+    check(!processReturned.load(std::memory_order_acquire),
+            "process finalizer returned while last-owner finalization was incomplete");
+    testResumeFinalization();
+    lastOwner.join();
+    processFinalizer.join();
+    check(testFinalized() && countSummary(readLines(path)) == 1,
+            "process callback versus last owner race was not exactly once");
+    testReset();
+}
+
+static void testOwnerAcquireFinalOwnerRace() {
+    std::string path = tempPath("vkd3d-telemetry-owner-acquire-final-owner-race.jsonl");
+    std::remove(path.c_str());
+    check(testInitialize(path, 3, 64), "owner acquire/final-owner initialization failed");
+    Owner finalOwner, contender;
+    check(finalOwner.acquire(), "final owner acquisition failed");
+    testArmFinalizationPause();
+    std::thread release([&] { finalOwner.release(); });
+
+    /* This pause is after the atomic last-owner/finalization claim and before
+     * any blocking drain. A contender must therefore see the permanent seal,
+     * rather than becoming an owner whose telemetry is finalized underneath it. */
+    testWaitFinalizationPaused();
+    check(!contender.acquire(),
+            "new owner acquired after the final owner claimed telemetry finalization");
+    check(testOwnerCount() == 0,
+            "failed post-finalization owner acquisition changed the owner count");
+    check(!isEnabled(), "telemetry stayed active after final-owner claim");
+    testResumeFinalization();
+    release.join();
+    check(testFinalized() && countSummary(readLines(path)) == 1,
+            "owner acquire/final-owner race did not leave one terminal SUMMARY");
+    testReset();
+}
+
+static void testOwnerConstructionUnwind() {
+    std::string path = tempPath("vkd3d-telemetry-owner-construction-unwind.jsonl");
+    std::remove(path.c_str());
+    check(testInitialize(path, 3, 64), "construction-unwind initialization failed");
+    try {
+        Owner owner;
+        check(owner.acquire(), "construction-unwind owner acquisition failed");
+        throw std::runtime_error("injected construction failure");
+    } catch (const std::runtime_error&) {
+    }
+    check(testFinalized() && countSummary(readLines(path)) == 1,
+            "owner construction unwind leaked ownership or duplicated finalization");
+    testReset();
+}
+
 int main() {
     testDisabled();
     testEnabledSchema();
@@ -399,6 +526,11 @@ int main() {
     testPostStartWriterFailure();
     testInitializationPublication();
     testConcurrentInitializationAndIds();
+    testOwnerLifecycle();
+    testProcessFinalizerWithLiveOwners();
+    testProcessFinalizerOwnerRace();
+    testOwnerAcquireFinalOwnerRace();
+    testOwnerConstructionUnwind();
     int failureCount = failures.load(std::memory_order_relaxed);
     if (failureCount)
         std::fprintf(stderr, "%d telemetry test failure(s).\n", failureCount);

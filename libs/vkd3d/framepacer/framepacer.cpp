@@ -42,6 +42,7 @@ namespace pacer {
 
         telemetry::initialize(m_frameSync.m_waitLatency);
         m_device->m_telemetryId = telemetry::allocateDeviceId();
+        m_telemetryOwner.acquire();
 
         // todo: add env var mode selection
 
@@ -94,6 +95,11 @@ namespace pacer {
         g_testLastTeardownWorkerStopped.store(
                 m_waitableDxgiSwapchain.stopped(), std::memory_order_release);
 #endif
+
+        /* No queue wrapper or worker owned by this FramePacer may emit after
+         * stop(). The Owner member is declared before that wrapper, so its
+         * construction-failure unwind also happens after wrapper destruction. */
+        m_telemetryOwner.release();
 
         delete m_presentationStats.load();
         delete m_gpuBufferStats.load();

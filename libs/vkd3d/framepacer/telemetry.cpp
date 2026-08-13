@@ -9,6 +9,7 @@
 #include <stdexcept>
 
 #ifdef _WIN32
+#include <windows.h>
 #include <process.h>
 #define get_process_id _getpid
 #else
@@ -20,8 +21,12 @@ namespace pacer::telemetry {
 
 static std::atomic<Session *> g_session = {nullptr};
 static std::mutex g_sessionMutex;
+static std::condition_variable g_lifecycleCond;
 static std::unique_ptr<Session> g_sessionOwner;
 static std::atomic<bool> g_initialized = {false};
+enum class Lifecycle : uint8_t { NeverInitialized, Unavailable, Active, Finalizing, Finalized };
+static std::atomic<Lifecycle> g_lifecycle = {Lifecycle::NeverInitialized};
+static uint32_t g_ownerCount;
 static constexpr uint64_t ProducerClosed = uint64_t(1) << 63;
 static constexpr uint64_t ProducerCountMask = ~ProducerClosed;
 static std::atomic<uint64_t> g_producerState = {ProducerClosed};
@@ -29,6 +34,34 @@ static std::mutex g_producerMutex;
 static std::condition_variable g_producerCond;
 static std::atomic<uint64_t> g_nextSwapchainId = {1};
 static std::atomic<uint64_t> g_nextDeviceId = {1};
+
+#ifdef _WIN32
+typedef void (WINAPI *WinePreExitCallback)(void *);
+typedef BOOL (WINAPI *WineRegisterPreExitCallback)(WinePreExitCallback, void *, HMODULE);
+static bool g_winePreExitRegistered;
+
+static void WINAPI winePreExitFinalizer(void *) {
+    shutdown();
+}
+
+static void registerWinePreExitFinalizer() noexcept {
+    if (g_winePreExitRegistered)
+        return;
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(winePreExitFinalizer), &module))
+        return;
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    FARPROC proc = ntdll ? GetProcAddress(ntdll,
+            "__wine_register_process_pre_exit_callback") : nullptr;
+    WineRegisterPreExitCallback registerCallback = nullptr;
+    static_assert(sizeof(registerCallback) == sizeof(proc));
+    std::memcpy(&registerCallback, &proc, sizeof(registerCallback));
+    if (registerCallback && registerCallback(winePreExitFinalizer, nullptr, module))
+        g_winePreExitRegistered = true;
+}
+#endif
 
 #ifdef VKD3D_ENABLE_TEST_HOOKS
 static std::mutex g_testPauseMutex;
@@ -42,6 +75,12 @@ static bool g_testInitializationPause = false;
 static bool g_testInitializationPaused = false;
 static bool g_testInitializationResume = false;
 static std::atomic<uint32_t> g_testInitializerEntries = {0};
+static std::mutex g_testFinalizationMutex;
+static std::condition_variable g_testFinalizationCond;
+static bool g_testFinalizationPause;
+static bool g_testFinalizationPaused;
+static bool g_testFinalizationResume;
+static uint32_t g_testFinalizationWaiters;
 
 static void testPauseProducer(ProducerPausePoint point) {
     std::unique_lock<std::mutex> lock(g_testPauseMutex);
@@ -66,10 +105,28 @@ static void testPauseInitialization() {
     g_testInitializationPaused = false;
     g_testInitializationResume = false;
 }
+
+static void testPauseFinalization() {
+    std::unique_lock<std::mutex> lock(g_testFinalizationMutex);
+    if (!g_testFinalizationPause)
+        return;
+    g_testFinalizationPaused = true;
+    g_testFinalizationCond.notify_all();
+    g_testFinalizationCond.wait(lock, [] { return g_testFinalizationResume; });
+    g_testFinalizationPause = false;
+    g_testFinalizationPaused = false;
+    g_testFinalizationResume = false;
+}
 #endif
 
 struct ProcessShutdown {
-    ~ProcessShutdown() { shutdown(); }
+    ~ProcessShutdown() {
+        /* PE C++ destructors run from DLL process detach under loader lock. The
+         * Wine pre-exit hook is the completeness authority; never join here. */
+#ifndef _WIN32
+        shutdown();
+#endif
+    }
 };
 static ProcessShutdown g_processShutdown;
 
@@ -553,6 +610,12 @@ static bool initializeLocked(const std::string& path, uint32_t waitLatency,
             g_sessionOwner.reset();
             return false;
         }
+        g_lifecycle.store(Lifecycle::Active, std::memory_order_release);
+#ifdef _WIN32
+        /* Registration pins this PE module. A failed registration leaves the
+         * clean last-owner path intact but deliberately makes no exit promise. */
+        registerWinePreExitFinalizer();
+#endif
         return true;
     } catch (...) {
         return false;
@@ -580,9 +643,11 @@ void initialize(uint32_t waitLatency) noexcept {
         else if (injectedFailure && !std::strcmp(injectedFailure, "thread"))
             failure = InitializationFailure::WriterThread;
 #endif
-        initializeLocked(path ? path : "", waitLatency, DefaultRingCapacity,
-                false, failure);
+        if (!initializeLocked(path ? path : "", waitLatency, DefaultRingCapacity,
+                false, failure))
+            g_lifecycle.store(Lifecycle::Unavailable, std::memory_order_release);
     } catch (...) {
+        g_lifecycle.store(Lifecycle::Unavailable, std::memory_order_release);
     }
     g_initialized.store(true, std::memory_order_release);
 }
@@ -620,20 +685,111 @@ static void waitForGlobalProducers() {
     });
 }
 
-void shutdown() {
-    std::lock_guard<std::mutex> lock(g_sessionMutex);
+/* Must be called with g_sessionMutex held. This is shared by the process
+ * finalizer and the final Owner::release(), so no new owner can enter between
+ * observing the last owner and sealing producer admission. */
+static bool claimFinalizationLocked() {
+    if (g_lifecycle.load(std::memory_order_relaxed) != Lifecycle::Active)
+        return false;
+
+    g_lifecycle.store(Lifecycle::Finalizing, std::memory_order_release);
     g_producerState.fetch_or(ProducerClosed, std::memory_order_acq_rel);
+    return true;
+}
+
+static void completeFinalization() {
+    std::unique_ptr<Session> session;
+
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    testPauseFinalization();
+#endif
+    /* Do not hold the lifecycle lock across an admitted producer wait or any
+     * writer work. Admitted producers retain the published Session until this
+     * wait completes. */
     waitForGlobalProducers();
-    g_session.store(nullptr, std::memory_order_release);
-    if (g_sessionOwner) {
-        g_sessionOwner->deactivateGlobal();
-        g_sessionOwner->shutdown();
+    {
+        std::lock_guard<std::mutex> lock(g_sessionMutex);
+        g_session.store(nullptr, std::memory_order_release);
+        session = std::move(g_sessionOwner);
     }
-    g_sessionOwner.reset();
+    if (session) {
+        session->deactivateGlobal();
+        session->shutdown();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_sessionMutex);
+        g_lifecycle.store(Lifecycle::Finalized, std::memory_order_release);
+    }
+    g_lifecycleCond.notify_all();
+}
+
+void shutdown() {
+    {
+        std::unique_lock<std::mutex> lock(g_sessionMutex);
+        if (g_lifecycle.load(std::memory_order_relaxed) == Lifecycle::Finalizing) {
+            /* A pre-exit caller that lost the ownership race must not return
+             * to Wine before the winning finalizer has joined the writer. */
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+            {
+                std::lock_guard<std::mutex> testLock(g_testFinalizationMutex);
+                ++g_testFinalizationWaiters;
+                g_testFinalizationCond.notify_all();
+            }
+#endif
+            g_lifecycleCond.wait(lock, [] {
+                return g_lifecycle.load(std::memory_order_acquire) != Lifecycle::Finalizing;
+            });
+            return;
+        }
+        if (!claimFinalizationLocked())
+            return;
+    }
+    completeFinalization();
 }
 
 bool isEnabled() {
-    return !(g_producerState.load(std::memory_order_relaxed) & ProducerClosed);
+    return g_lifecycle.load(std::memory_order_acquire) == Lifecycle::Active &&
+            !(g_producerState.load(std::memory_order_relaxed) & ProducerClosed);
+}
+
+Owner::~Owner() { release(); }
+
+Owner::Owner(Owner&& other) noexcept : m_acquired(other.m_acquired) {
+    other.m_acquired = false;
+}
+
+Owner& Owner::operator=(Owner&& other) noexcept {
+    if (this != &other) {
+        release();
+        m_acquired = other.m_acquired;
+        other.m_acquired = false;
+    }
+    return *this;
+}
+
+bool Owner::acquire() noexcept {
+    if (m_acquired)
+        return true;
+    std::lock_guard<std::mutex> lock(g_sessionMutex);
+    if (g_lifecycle.load(std::memory_order_relaxed) != Lifecycle::Active)
+        return false;
+    ++g_ownerCount;
+    m_acquired = true;
+    return true;
+}
+
+void Owner::release() noexcept {
+    bool finalizer = false;
+    {
+        std::lock_guard<std::mutex> lock(g_sessionMutex);
+        if (!m_acquired)
+            return;
+        m_acquired = false;
+        if (--g_ownerCount == 0)
+            finalizer = claimFinalizationLocked();
+    }
+    if (finalizer)
+        completeFinalization();
 }
 
 bool emit(Event event) {
@@ -667,6 +823,8 @@ bool testInitialize(const std::string& path, uint32_t waitLatency,
     std::lock_guard<std::mutex> lock(g_sessionMutex);
     g_initialized.store(false, std::memory_order_release);
     bool result = initializeLocked(path, waitLatency, capacity, deferWriter, failure);
+    if (!result)
+        g_lifecycle.store(Lifecycle::Unavailable, std::memory_order_release);
     g_initialized.store(true, std::memory_order_release);
     return result;
 }
@@ -675,8 +833,17 @@ void testReset() {
     shutdown();
     std::lock_guard<std::mutex> lock(g_sessionMutex);
     g_initialized.store(false, std::memory_order_release);
+    g_lifecycle.store(Lifecycle::NeverInitialized, std::memory_order_release);
     g_producerState.store(ProducerClosed, std::memory_order_release);
+    g_ownerCount = 0;
     g_testInitializerEntries.store(0, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> testLock(g_testFinalizationMutex);
+        g_testFinalizationPause = false;
+        g_testFinalizationPaused = false;
+        g_testFinalizationResume = false;
+        g_testFinalizationWaiters = 0;
+    }
 }
 
 void testArmProducerPause(ProducerPausePoint point) {
@@ -731,6 +898,43 @@ bool testInitializationComplete() {
 
 uint32_t testInitializerEntryCount() {
     return g_testInitializerEntries.load(std::memory_order_acquire);
+}
+
+void testProcessExitFinalizer() {
+    shutdown();
+}
+
+uint32_t testOwnerCount() {
+    std::lock_guard<std::mutex> lock(g_sessionMutex);
+    return g_ownerCount;
+}
+
+bool testFinalized() {
+    return g_lifecycle.load(std::memory_order_acquire) == Lifecycle::Finalized;
+}
+
+void testArmFinalizationPause() {
+    std::lock_guard<std::mutex> lock(g_testFinalizationMutex);
+    g_testFinalizationPause = true;
+    g_testFinalizationPaused = false;
+    g_testFinalizationResume = false;
+    g_testFinalizationWaiters = 0;
+}
+
+void testWaitFinalizationPaused() {
+    std::unique_lock<std::mutex> lock(g_testFinalizationMutex);
+    g_testFinalizationCond.wait(lock, [] { return g_testFinalizationPaused; });
+}
+
+void testResumeFinalization() {
+    std::lock_guard<std::mutex> lock(g_testFinalizationMutex);
+    g_testFinalizationResume = true;
+    g_testFinalizationCond.notify_all();
+}
+
+void testWaitForFinalizationWaiter() {
+    std::unique_lock<std::mutex> lock(g_testFinalizationMutex);
+    g_testFinalizationCond.wait(lock, [] { return g_testFinalizationWaiters; });
 }
 #endif
 
