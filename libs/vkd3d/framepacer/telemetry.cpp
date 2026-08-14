@@ -30,6 +30,8 @@ static std::unique_ptr<Session> g_sessionOwner;
 static std::atomic<bool> g_initialized = {false};
 enum class Lifecycle : uint8_t { NeverInitialized, Unavailable, Active, Finalizing, Finalized };
 static std::atomic<Lifecycle> g_lifecycle = {Lifecycle::NeverInitialized};
+enum class FinalizationAuthority : uint8_t { LastOwnerFallback, ProcessPreExit };
+static FinalizationAuthority g_finalizationAuthority = FinalizationAuthority::LastOwnerFallback;
 static uint32_t g_ownerCount;
 static constexpr uint64_t ProducerClosed = uint64_t(1) << 63;
 static constexpr uint64_t ProducerCountMask = ~ProducerClosed;
@@ -48,14 +50,14 @@ static void WINAPI winePreExitFinalizer(void *) {
     shutdown();
 }
 
-static void registerWinePreExitFinalizer() noexcept {
+static bool registerWinePreExitFinalizer() noexcept {
     if (g_winePreExitRegistered)
-        return;
+        return true;
     HMODULE module = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             reinterpret_cast<LPCWSTR>(winePreExitFinalizer), &module))
-        return;
+        return false;
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     FARPROC proc = ntdll ? GetProcAddress(ntdll,
             "__wine_register_process_pre_exit_callback") : nullptr;
@@ -64,6 +66,7 @@ static void registerWinePreExitFinalizer() noexcept {
     std::memcpy(&registerCallback, &proc, sizeof(registerCallback));
     if (registerCallback && registerCallback(winePreExitFinalizer, nullptr, module))
         g_winePreExitRegistered = true;
+    return g_winePreExitRegistered;
 }
 #endif
 
@@ -627,7 +630,11 @@ void Session::testWaitWriterFailed() {
 
 static bool initializeLocked(const std::string& path, uint32_t waitLatency,
         uint32_t capacity, bool deferWriter,
-        InitializationFailure failure) noexcept {
+        InitializationFailure failure
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        , TestFinalizationAuthority testAuthority = TestFinalizationAuthority::Auto
+#endif
+        ) noexcept {
     if (path.empty())
         return false;
     try {
@@ -654,12 +661,23 @@ static bool initializeLocked(const std::string& path, uint32_t waitLatency,
             g_sessionOwner.reset();
             return false;
         }
-        g_lifecycle.store(Lifecycle::Active, std::memory_order_release);
-#ifdef _WIN32
-        /* Registration pins this PE module. A failed registration leaves the
-         * clean last-owner path intact but deliberately makes no exit promise. */
-        registerWinePreExitFinalizer();
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        if (testAuthority == TestFinalizationAuthority::ProcessPreExit)
+            g_finalizationAuthority = FinalizationAuthority::ProcessPreExit;
+        else if (testAuthority == TestFinalizationAuthority::LastOwnerFallback)
+            g_finalizationAuthority = FinalizationAuthority::LastOwnerFallback;
+        else
 #endif
+#ifdef _WIN32
+        /* Once registration succeeds, process pre-exit authority is sticky:
+         * accepted vkd3d never unregisters or transfers that authority. */
+        g_finalizationAuthority = registerWinePreExitFinalizer()
+                ? FinalizationAuthority::ProcessPreExit
+                : FinalizationAuthority::LastOwnerFallback;
+#else
+        g_finalizationAuthority = FinalizationAuthority::LastOwnerFallback;
+#endif
+        g_lifecycle.store(Lifecycle::Active, std::memory_order_release);
         return true;
     } catch (...) {
         return false;
@@ -688,7 +706,11 @@ void initialize(uint32_t waitLatency) noexcept {
             failure = InitializationFailure::WriterThread;
 #endif
         if (!initializeLocked(path ? path : "", waitLatency, DefaultRingCapacity,
-                false, failure))
+                false, failure
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+                , TestFinalizationAuthority::Auto
+#endif
+                ))
             g_lifecycle.store(Lifecycle::Unavailable, std::memory_order_release);
     } catch (...) {
         g_lifecycle.store(Lifecycle::Unavailable, std::memory_order_release);
@@ -829,7 +851,8 @@ void Owner::release() noexcept {
         if (!m_acquired)
             return;
         m_acquired = false;
-        if (--g_ownerCount == 0)
+        if (--g_ownerCount == 0 &&
+                g_finalizationAuthority == FinalizationAuthority::LastOwnerFallback)
             finalizer = claimFinalizationLocked();
     }
     if (finalizer)
@@ -862,11 +885,12 @@ uint64_t allocateDeviceId() {
 
 #ifdef VKD3D_ENABLE_TEST_HOOKS
 bool testInitialize(const std::string& path, uint32_t waitLatency,
-        uint32_t capacity, bool deferWriter, InitializationFailure failure) {
+        uint32_t capacity, bool deferWriter, InitializationFailure failure,
+        TestFinalizationAuthority authority) {
     testReset();
     std::lock_guard<std::mutex> lock(g_sessionMutex);
     g_initialized.store(false, std::memory_order_release);
-    bool result = initializeLocked(path, waitLatency, capacity, deferWriter, failure);
+    bool result = initializeLocked(path, waitLatency, capacity, deferWriter, failure, authority);
     if (!result)
         g_lifecycle.store(Lifecycle::Unavailable, std::memory_order_release);
     g_initialized.store(true, std::memory_order_release);
@@ -963,8 +987,19 @@ uint32_t testOwnerCount() {
     return g_ownerCount;
 }
 
+bool testActive() {
+    return g_lifecycle.load(std::memory_order_acquire) == Lifecycle::Active;
+}
+
 bool testFinalized() {
     return g_lifecycle.load(std::memory_order_acquire) == Lifecycle::Finalized;
+}
+
+TestFinalizationAuthority testFinalizationAuthority() {
+    std::lock_guard<std::mutex> lock(g_sessionMutex);
+    return g_finalizationAuthority == FinalizationAuthority::ProcessPreExit
+            ? TestFinalizationAuthority::ProcessPreExit
+            : TestFinalizationAuthority::LastOwnerFallback;
 }
 
 void testArmFinalizationPause() {

@@ -153,7 +153,8 @@ private:
 
 void initialize(uint32_t waitLatency) noexcept;
 /* A FramePacer keeps one of these only while its telemetry-bearing work can
- * still publish. Releasing the last owner is the clean-device fallback. */
+ * still publish. Releasing the last owner is the clean-device fallback when
+ * process pre-exit authority is unavailable. */
 class Owner {
 public:
     Owner() = default;
@@ -176,6 +177,12 @@ uint64_t allocateSwapchainId();
 uint64_t allocateDeviceId();
 
 #ifdef VKD3D_ENABLE_TEST_HOOKS
+enum class TestFinalizationAuthority : uint8_t {
+    Auto,
+    LastOwnerFallback,
+    ProcessPreExit,
+};
+
 enum class ProducerPausePoint : uint8_t {
     None,
     GlobalAcquired,
@@ -184,7 +191,8 @@ enum class ProducerPausePoint : uint8_t {
 
 bool testInitialize(const std::string& path, uint32_t waitLatency,
         uint32_t capacity = DefaultRingCapacity, bool deferWriter = false,
-        InitializationFailure failure = InitializationFailure::None);
+        InitializationFailure failure = InitializationFailure::None,
+        TestFinalizationAuthority authority = TestFinalizationAuthority::LastOwnerFallback);
 std::string testOutputPath();
 std::string testOutputPathForIdentity(const std::string& path, uint64_t processId,
         uint64_t runId);
@@ -201,7 +209,9 @@ bool testInitializationComplete();
 uint32_t testInitializerEntryCount();
 void testProcessExitFinalizer();
 uint32_t testOwnerCount();
+bool testActive();
 bool testFinalized();
+TestFinalizationAuthority testFinalizationAuthority();
 void testArmFinalizationPause();
 void testWaitFinalizationPaused();
 void testResumeFinalization();

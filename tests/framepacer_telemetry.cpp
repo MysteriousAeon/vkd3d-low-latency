@@ -66,6 +66,12 @@ static unsigned countSummary(const std::vector<std::string>& lines) {
     });
 }
 
+static unsigned countRun(const std::vector<std::string>& lines) {
+    return std::count_if(lines.begin(), lines.end(), [](const std::string& line) {
+        return line.find("\"record_type\":\"RUN\"") != std::string::npos;
+    });
+}
+
 static uint64_t sequenceOf(const std::string& line) {
     const std::string key = "\"event_sequence\":";
     size_t position = line.find(key);
@@ -424,7 +430,9 @@ static void testConcurrentInitializationAndIds() {
 static void testOwnerLifecycle() {
     std::string path = tempPath("vkd3d-telemetry-owner-lifecycle.jsonl");
     std::remove(path.c_str());
-    check(testInitialize(path, 3, 64), "owner lifecycle initialization failed");
+    check(testInitialize(path, 3, 64, false, InitializationFailure::None,
+            TestFinalizationAuthority::LastOwnerFallback),
+            "owner lifecycle initialization failed");
     std::string output = testOutputPath();
     Owner ownerA, ownerB;
     check(ownerA.acquire() && ownerB.acquire() && testOwnerCount() == 2,
@@ -451,7 +459,9 @@ static void testOwnerLifecycle() {
 static void testProcessFinalizerWithLiveOwners() {
     std::string path = tempPath("vkd3d-telemetry-process-finalizer.jsonl");
     std::remove(path.c_str());
-    check(testInitialize(path, 3, 8, true), "process-finalizer initialization failed");
+    check(testInitialize(path, 3, 8, true, InitializationFailure::None,
+            TestFinalizationAuthority::ProcessPreExit),
+            "process-finalizer initialization failed");
     std::string output = testOutputPath();
     Owner ownerA, ownerB;
     check(ownerA.acquire() && ownerB.acquire(), "live owners failed to acquire telemetry");
@@ -479,10 +489,81 @@ static void testProcessFinalizerWithLiveOwners() {
     testReset();
 }
 
+static void testProcessPreExitTransientZeroOwners() {
+    std::string path = tempPath("vkd3d-telemetry-process-pre-exit-zero-owner-gap.jsonl");
+    std::remove(path.c_str());
+    check(testInitialize(path, 3, 64, false, InitializationFailure::None,
+            TestFinalizationAuthority::ProcessPreExit),
+            "process-pre-exit zero-owner initialization failed");
+    std::string output = testOutputPath();
+    check(testFinalizationAuthority() == TestFinalizationAuthority::ProcessPreExit,
+            "process-pre-exit authority was not elected");
+
+    Owner ownerA, ownerB;
+    check(ownerA.acquire(), "first owner failed to acquire process-pre-exit telemetry");
+    Event first;
+    first.id0 = 0xa11;
+    check(emit(first), "first owner failed to emit telemetry");
+    ownerA.release();
+    check(testActive() && isEnabled() && testOwnerCount() == 0 && !testGlobalClosing(),
+            "process-pre-exit authority finalized during a transient zero-owner gap");
+    check(countSummary(readLines(output)) == 0,
+            "transient zero-owner gap produced a SUMMARY");
+
+    check(ownerB.acquire() && testOwnerCount() == 1,
+            "second owner could not acquire the still-active telemetry session");
+    Event second;
+    second.id0 = 0xb22;
+    check(emit(second), "second owner telemetry event was rejected after zero-owner gap");
+    testProcessExitFinalizer();
+
+    auto lines = readLines(output);
+    check(countRun(lines) == 1, "transient zero-owner gap created more than one RUN");
+    check(std::any_of(lines.begin(), lines.end(), [](const std::string& line) {
+        return line.find("\"id0\":2850") != std::string::npos;
+    }), "second owner telemetry event did not survive process finalization");
+    check(countSummary(lines) == 1 && !lines.empty() &&
+            lines.back().find("\"record_type\":\"SUMMARY\"") != std::string::npos,
+            "process finalization did not leave one terminal SUMMARY");
+    check(lines.back().find("\"dropped_records\":0") != std::string::npos,
+            "deterministic transient zero-owner test dropped telemetry");
+    ownerB.release();
+    testReset();
+}
+
+static void testProcessPreExitAcquireRace() {
+    std::string path = tempPath("vkd3d-telemetry-process-pre-exit-acquire-race.jsonl");
+    std::remove(path.c_str());
+    check(testInitialize(path, 3, 64, false, InitializationFailure::None,
+            TestFinalizationAuthority::ProcessPreExit),
+            "process-pre-exit acquire-race initialization failed");
+    std::string output = testOutputPath();
+    check(testActive() && testOwnerCount() == 0,
+            "process-pre-exit acquire-race did not start active with zero owners");
+    testArmFinalizationPause();
+    std::thread finalizer([] { testProcessExitFinalizer(); });
+    testWaitFinalizationPaused();
+
+    Owner contender;
+    check(!contender.acquire(), "owner acquired after process pre-exit sealed telemetry");
+    check(testOwnerCount() == 0,
+            "failed acquisition after process pre-exit changed owner count");
+    testResumeFinalization();
+    finalizer.join();
+
+    auto lines = readLines(output);
+    check(testFinalized() && countSummary(lines) == 1 && !lines.empty() &&
+            lines.back().find("\"record_type\":\"SUMMARY\"") != std::string::npos,
+            "process pre-exit versus acquisition race did not leave one terminal SUMMARY");
+    testReset();
+}
+
 static void testProcessFinalizerOwnerRace() {
     std::string path = tempPath("vkd3d-telemetry-finalizer-owner-race.jsonl");
     std::remove(path.c_str());
-    check(testInitialize(path, 3, 64), "finalizer race initialization failed");
+    check(testInitialize(path, 3, 64, false, InitializationFailure::None,
+            TestFinalizationAuthority::LastOwnerFallback),
+            "finalizer race initialization failed");
     std::string output = testOutputPath();
     Owner owner;
     check(owner.acquire(), "race owner acquisition failed");
@@ -508,7 +589,9 @@ static void testProcessFinalizerOwnerRace() {
 static void testOwnerAcquireFinalOwnerRace() {
     std::string path = tempPath("vkd3d-telemetry-owner-acquire-final-owner-race.jsonl");
     std::remove(path.c_str());
-    check(testInitialize(path, 3, 64), "owner acquire/final-owner initialization failed");
+    check(testInitialize(path, 3, 64, false, InitializationFailure::None,
+            TestFinalizationAuthority::LastOwnerFallback),
+            "owner acquire/final-owner initialization failed");
     std::string output = testOutputPath();
     Owner finalOwner, contender;
     check(finalOwner.acquire(), "final owner acquisition failed");
@@ -534,7 +617,9 @@ static void testOwnerAcquireFinalOwnerRace() {
 static void testOwnerConstructionUnwind() {
     std::string path = tempPath("vkd3d-telemetry-owner-construction-unwind.jsonl");
     std::remove(path.c_str());
-    check(testInitialize(path, 3, 64), "construction-unwind initialization failed");
+    check(testInitialize(path, 3, 64, false, InitializationFailure::None,
+            TestFinalizationAuthority::LastOwnerFallback),
+            "construction-unwind initialization failed");
     std::string output = testOutputPath();
     try {
         Owner owner;
@@ -1191,6 +1276,8 @@ int main(int argc, char **argv) {
     testConcurrentInitializationAndIds();
     testOwnerLifecycle();
     testProcessFinalizerWithLiveOwners();
+    testProcessPreExitTransientZeroOwners();
+    testProcessPreExitAcquireRace();
     testProcessFinalizerOwnerRace();
     testOwnerAcquireFinalOwnerRace();
     testOwnerConstructionUnwind();
