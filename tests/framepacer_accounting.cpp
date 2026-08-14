@@ -1669,6 +1669,7 @@ static void run_telemetry_completion_identity_case()
     std::remove(path);
     check(pacer::telemetry::testInitialize(path, 3, 64),
             "telemetry-completion: failed to initialize telemetry session.\n");
+    std::string output_path = pacer::telemetry::testOutputPath();
     uint64_t old_command = 0;
     uint64_t old_vulkan = 0;
     uint64_t newer_command = 0;
@@ -1723,7 +1724,7 @@ static void run_telemetry_completion_identity_case()
     }
     pacer::telemetry::shutdown();
 
-    std::ifstream stream(path);
+    std::ifstream stream(output_path);
     std::string line;
     unsigned completions = 0;
     bool oldExact = false;
@@ -1828,6 +1829,7 @@ static void run_telemetry_completion_metadata_lifetime_case()
     std::remove(command_path);
     check(pacer::telemetry::testInitialize(command_path, 3, 64),
             "telemetry-command-reclaim: failed to initialize telemetry session.\n");
+    std::string command_output_path = pacer::telemetry::testOutputPath();
     fixture::submit_pair command_submit = {};
     {
         fixture f(true, false);
@@ -1842,7 +1844,7 @@ static void run_telemetry_completion_metadata_lifetime_case()
     pacer::telemetry::shutdown();
 
     {
-        std::ifstream stream(command_path);
+        std::ifstream stream(command_output_path);
         std::string line;
         unsigned completions = 0;
         bool exact = false;
@@ -1864,6 +1866,7 @@ static void run_telemetry_completion_metadata_lifetime_case()
     std::remove(vulkan_path);
     check(pacer::telemetry::testInitialize(vulkan_path, 3, 64),
             "telemetry-vulkan-reclaim: failed to initialize telemetry session.\n");
+    std::string vulkan_output_path = pacer::telemetry::testOutputPath();
     fixture::submit_pair vulkan_submit = {};
     {
         fixture f(true, false);
@@ -1891,7 +1894,7 @@ static void run_telemetry_completion_metadata_lifetime_case()
     pacer::telemetry::shutdown();
 
     {
-        std::ifstream stream(vulkan_path);
+        std::ifstream stream(vulkan_output_path);
         std::string line;
         unsigned completions = 0;
         bool exact = false;

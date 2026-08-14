@@ -80,6 +80,8 @@ public:
     Session& operator=(const Session&) = delete;
 
     bool enabled() const { return m_enabled.load(std::memory_order_acquire); }
+    /* The configured path is a base; an enabled session owns this unique output. */
+    const std::string& outputPath() const { return m_outputPath; }
     bool publish(Event event);
     void shutdown();
     uint64_t dropped() const { return m_dropped.load(std::memory_order_relaxed); }
@@ -124,6 +126,7 @@ private:
     uint32_t m_mask = 0;
     uint32_t m_waitLatency = 0;
     std::unique_ptr<FILE, FileCloser> m_file;
+    std::string m_outputPath;
     std::thread m_writer;
     std::mutex m_waitMutex;
     std::condition_variable m_waitCond;
@@ -182,6 +185,9 @@ enum class ProducerPausePoint : uint8_t {
 bool testInitialize(const std::string& path, uint32_t waitLatency,
         uint32_t capacity = DefaultRingCapacity, bool deferWriter = false,
         InitializationFailure failure = InitializationFailure::None);
+std::string testOutputPath();
+std::string testOutputPathForIdentity(const std::string& path, uint64_t processId,
+        uint64_t runId);
 void testReset();
 void testArmProducerPause(ProducerPausePoint point);
 void testWaitProducerPaused();

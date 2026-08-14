@@ -3,6 +3,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <iomanip>
 #include <inttypes.h>
 #include <new>
 #include <sstream>
@@ -10,7 +12,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>
 #include <process.h>
+#include <sys/stat.h>
 #define get_process_id _getpid
 #else
 #include <unistd.h>
@@ -142,6 +146,42 @@ static uint32_t normalizeCapacity(uint32_t capacity) {
     return result;
 }
 
+static std::string outputPathForIdentity(const std::string& path, uint64_t processId,
+        uint64_t runId) {
+    const size_t directoryEnd = path.find_last_of("/\\\\");
+    const size_t filenameStart = directoryEnd == std::string::npos ? 0 : directoryEnd + 1;
+    const size_t extensionStart = path.find_last_of('.');
+    const bool hasExtension = extensionStart != std::string::npos &&
+            extensionStart > filenameStart;
+    std::ostringstream output;
+    output << path.substr(0, hasExtension ? extensionStart : path.size())
+           << ".pid-" << processId << ".run-" << std::hex << std::setw(16)
+           << std::setfill('0') << runId;
+    if (hasExtension)
+        output << path.substr(extensionStart);
+    return output.str();
+}
+
+static FILE *openExclusiveOutput(const std::string& path) {
+#ifdef _WIN32
+    int fd = _open(path.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+            _S_IREAD | _S_IWRITE);
+    if (fd < 0)
+        return nullptr;
+    FILE *file = _fdopen(fd, "wb");
+    if (!file)
+        _close(fd);
+#else
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0)
+        return nullptr;
+    FILE *file = fdopen(fd, "wb");
+    if (!file)
+        close(fd);
+#endif
+    return file;
+}
+
 Session::Session(const std::string& path, uint32_t waitLatency, uint32_t capacity
 #ifdef VKD3D_ENABLE_TEST_HOOKS
         , bool deferWriter, InitializationFailure failure
@@ -160,9 +200,13 @@ Session::Session(const std::string& path, uint32_t waitLatency, uint32_t capacit
         if (failure == InitializationFailure::FileOpen)
             return;
 #endif
-        m_file.reset(std::fopen(path.c_str(), "wb"));
+        m_outputPath = outputPathForIdentity(path, uint64_t(get_process_id()), m_runId);
+        m_file.reset(openExclusiveOutput(m_outputPath));
         if (!m_file)
+        {
+            m_outputPath.clear();
             return;
+        }
 #ifdef VKD3D_ENABLE_TEST_HOOKS
         if (failure == InitializationFailure::Allocation)
             throw std::bad_alloc();
@@ -827,6 +871,16 @@ bool testInitialize(const std::string& path, uint32_t waitLatency,
         g_lifecycle.store(Lifecycle::Unavailable, std::memory_order_release);
     g_initialized.store(true, std::memory_order_release);
     return result;
+}
+
+std::string testOutputPath() {
+    std::lock_guard<std::mutex> lock(g_sessionMutex);
+    return g_sessionOwner ? g_sessionOwner->outputPath() : "";
+}
+
+std::string testOutputPathForIdentity(const std::string& path, uint64_t processId,
+        uint64_t runId) {
+    return outputPathForIdentity(path, processId, runId);
 }
 
 void testReset() {
