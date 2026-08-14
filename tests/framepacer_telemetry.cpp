@@ -17,9 +17,11 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <process.h>
 #else
 #include <dirent.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -89,6 +91,55 @@ static void setTelemetryPath(const std::string& path) {
         setenv("VKD3D_FG_LATENCY_TELEMETRY", path.c_str(), 1);
 #endif
 }
+
+#ifdef _WIN32
+static void setTelemetryControl(const std::string& token) {
+    _putenv_s("VKD3D_FG_LATENCY_TELEMETRY_CONTROL", token.c_str());
+}
+
+static std::string controlEndpoint(const std::string& token) {
+    return "\\\\.\\pipe\\vkd3d-fg-latency-" + token + "-" +
+            std::to_string(unsigned(_getpid()));
+}
+
+static std::string controlHelperPath() {
+    char module[MAX_PATH];
+    DWORD length = GetModuleFileNameA(nullptr, module, sizeof(module));
+    std::string path(module, length);
+    size_t tests = path.rfind("\\tests\\");
+    if (tests == std::string::npos)
+        return "";
+    return path.substr(0, tests) +
+            "\\programs\\vkd3d-fg-latency-control\\vkd3d-fg-latency-control.exe";
+}
+
+static void testPipeTransportRoundTrip() {
+    const std::string disabledToken = "disabled-control";
+    const std::string token = "explicit-finalize-control";
+    std::string path = tempPath("vkd3d-telemetry-pipe-control.jsonl");
+    std::remove(path.c_str());
+    setTelemetryControl("");
+    check(testInitialize(path, 3, 64), "disabled control initialization failed");
+    check(!WaitNamedPipeA(controlEndpoint(disabledToken).c_str(), 0),
+            "telemetry control endpoint existed without an explicit token");
+    testReset();
+
+    setTelemetryControl(token);
+    check(testInitialize(path, 3, 64), "enabled control initialization failed");
+    std::string output = testOutputPath();
+    std::string helper = controlHelperPath();
+    std::string pid = std::to_string(unsigned(_getpid()));
+    intptr_t result = helper.empty() ? -1 : _spawnl(_P_WAIT, helper.c_str(), helper.c_str(),
+            token.c_str(), pid.c_str(), nullptr);
+    check(result == 0 && testFinalized() && countSummary(readLines(output)) == 1,
+            "control helper did not receive terminal SUCCESS from FINALIZE");
+    intptr_t late = helper.empty() ? 0 : _spawnl(_P_WAIT, helper.c_str(), helper.c_str(),
+            token.c_str(), pid.c_str(), nullptr);
+    check(late != 0, "late one-shot control request unexpectedly succeeded");
+    setTelemetryControl("");
+    testReset();
+}
+#endif
 
 static void testDisabled() {
     std::string path = tempPath("vkd3d-telemetry-disabled.jsonl");
@@ -489,6 +540,130 @@ static void testProcessFinalizerWithLiveOwners() {
     testReset();
 }
 
+static void testExplicitFinalizeActiveProducer() {
+    std::string path = tempPath("vkd3d-telemetry-explicit-active-producer.jsonl");
+    std::remove(path.c_str());
+    check(testInitialize(path, 3, 8, true, InitializationFailure::None,
+            TestFinalizationAuthority::ProcessPreExit),
+            "explicit active-producer initialization failed");
+    std::string output = testOutputPath();
+    testArmProducerPause(ProducerPausePoint::GlobalAcquired);
+    std::atomic<bool> published = {false};
+    std::atomic<ExplicitFinalizeResult> result = {ExplicitFinalizeResult::Unavailable};
+    std::thread producer([&] { published.store(emit({}), std::memory_order_release); });
+    testWaitProducerPaused();
+    std::thread finalizer([&] {
+        result.store(testExplicitFinalize(), std::memory_order_release);
+    });
+    while (!testGlobalClosing())
+        std::this_thread::yield();
+    check(result.load(std::memory_order_acquire) == ExplicitFinalizeResult::Unavailable,
+            "explicit finalizer completed before an admitted producer");
+    check(!emit({}), "new producer was admitted after explicit cutoff");
+    testResumeProducer();
+    producer.join();
+    finalizer.join();
+    auto lines = readLines(output);
+    check(published.load(std::memory_order_acquire),
+            "producer admitted before explicit cutoff was not retained");
+    check(result.load(std::memory_order_acquire) == ExplicitFinalizeResult::Success &&
+            testFinalized() && countRun(lines) == 1 && countSummary(lines) == 1 &&
+            lines.size() == 3 && lines.back().find("\"published_records\":1") != std::string::npos,
+            "explicit finalization did not truthfully complete admitted producer capture");
+    testReset();
+}
+
+static void testExplicitFinalizeThenProcessPreExit() {
+    std::string path = tempPath("vkd3d-telemetry-explicit-then-pre-exit.jsonl");
+    std::remove(path.c_str());
+    check(testInitialize(path, 3, 64, false, InitializationFailure::None,
+            TestFinalizationAuthority::ProcessPreExit),
+            "explicit/pre-exit initialization failed");
+    std::string output = testOutputPath();
+    check(testExplicitFinalize() == ExplicitFinalizeResult::Success,
+            "explicit finalization did not report terminal success");
+    testProcessExitFinalizer();
+    check(testFinalized() && countSummary(readLines(output)) == 1,
+            "process pre-exit repeated explicit finalization");
+    Owner later;
+    check(!later.acquire(), "owner acquired after explicit finalization");
+    testReset();
+}
+
+static void testExplicitProcessPreExitRace() {
+    for (bool explicitWins : {true, false}) {
+        std::string path = tempPath(explicitWins
+                ? "vkd3d-telemetry-explicit-wins-race.jsonl"
+                : "vkd3d-telemetry-pre-exit-wins-race.jsonl");
+        std::remove(path.c_str());
+        check(testInitialize(path, 3, 64, false, InitializationFailure::None,
+                TestFinalizationAuthority::ProcessPreExit), "explicit/pre-exit race initialization failed");
+        std::string output = testOutputPath();
+        testArmFinalizationPause();
+        std::atomic<ExplicitFinalizeResult> explicitResult = {ExplicitFinalizeResult::Unavailable};
+        std::thread winner([&] {
+            if (explicitWins)
+                explicitResult.store(testExplicitFinalize(), std::memory_order_release);
+            else
+                testProcessExitFinalizer();
+        });
+        testWaitFinalizationPaused();
+        if (explicitWins) {
+            std::thread loser([] { testProcessExitFinalizer(); });
+            testWaitForFinalizationWaiter();
+            testResumeFinalization();
+            loser.join();
+        } else {
+            check(testExplicitFinalize() == ExplicitFinalizeResult::AlreadyFinalizing,
+                    "explicit loser did not report an in-progress pre-exit finalizer");
+            testResumeFinalization();
+        }
+        winner.join();
+        auto lines = readLines(output);
+        check(testFinalized() && countSummary(lines) == 1,
+                "explicit/pre-exit race did not leave exactly one terminal SUMMARY");
+        if (explicitWins)
+            check(explicitResult.load(std::memory_order_acquire) == ExplicitFinalizeResult::Success,
+                    "explicit race winner did not wait for terminal completion");
+        testReset();
+    }
+}
+
+static void testDuplicateExplicitFinalize() {
+    std::string path = tempPath("vkd3d-telemetry-duplicate-explicit.jsonl");
+    std::remove(path.c_str());
+    check(testInitialize(path, 3, 64, false), "duplicate explicit initialization failed");
+    std::string output = testOutputPath();
+    testArmFinalizationPause();
+    std::atomic<ExplicitFinalizeResult> winner = {ExplicitFinalizeResult::Unavailable};
+    std::thread finalizer([&] { winner.store(testExplicitFinalize(), std::memory_order_release); });
+    testWaitFinalizationPaused();
+    check(testExplicitFinalize() == ExplicitFinalizeResult::AlreadyFinalizing,
+            "concurrent duplicate explicit request did not report finalizing");
+    testResumeFinalization();
+    finalizer.join();
+    check(winner.load(std::memory_order_acquire) == ExplicitFinalizeResult::Success &&
+            testExplicitFinalize() == ExplicitFinalizeResult::AlreadyFinalized &&
+            countSummary(readLines(output)) == 1,
+            "duplicate explicit finalization was not exactly once and truthful");
+    testReset();
+}
+
+static void testExplicitFinalizeIncompleteResult() {
+    std::string path = tempPath("vkd3d-telemetry-explicit-incomplete-result.jsonl");
+    std::remove(path.c_str());
+    check(testInitialize(path, 3, 8, false, InitializationFailure::WriterRuntime),
+            "incomplete explicit finalization initialization failed");
+    std::string output = testOutputPath();
+    check(emit({}), "writer-failure trigger event was not accepted");
+    testWaitGlobalWriterFailed();
+    check(testExplicitFinalize() == ExplicitFinalizeResult::FailedIncomplete && testFinalized(),
+            "explicit finalization fabricated success after a writer failure");
+    check(countSummary(readLines(output)) == 0,
+            "writer-failed explicit finalization fabricated a terminal SUMMARY");
+    testReset();
+}
+
 static void testProcessPreExitTransientZeroOwners() {
     std::string path = tempPath("vkd3d-telemetry-process-pre-exit-zero-owner-gap.jsonl");
     std::remove(path.c_str());
@@ -515,7 +690,8 @@ static void testProcessPreExitTransientZeroOwners() {
     Event second;
     second.id0 = 0xb22;
     check(emit(second), "second owner telemetry event was rejected after zero-owner gap");
-    testProcessExitFinalizer();
+    check(testExplicitFinalize() == ExplicitFinalizeResult::Success,
+            "explicit finalization after zero-owner gap did not complete");
 
     auto lines = readLines(output);
     check(countRun(lines) == 1, "transient zero-owner gap created more than one RUN");
@@ -1150,6 +1326,67 @@ static int telemetryChild(const char *path, const char *role, int signalFd, int 
     return role[0] == 'b' && !writeAll(signalFd, output + "\n") ? 5 : 0;
 }
 
+static int incompleteFinalizeChild(const char *path, int signalFd, bool duringFinalization) {
+    if (!testInitialize(path, 3, 64, false, InitializationFailure::None,
+            TestFinalizationAuthority::ProcessPreExit))
+        return 1;
+    std::string output = testOutputPath();
+    if (duringFinalization) {
+        testArmFinalizationPause();
+        std::thread finalizer([] { testExplicitFinalize(); });
+        testWaitFinalizationPaused();
+        if (!writeAll(signalFd, output + "\n"))
+            _exit(2);
+        /* The parent terminates this child while the finalizer is paused after
+         * its permanent claim and before terminal writer completion. */
+        for (;;)
+            pause();
+    }
+    if (!writeAll(signalFd, output + "\n"))
+        return 3;
+    _exit(0); /* No destructor/pre-exit finalizer: retain the incomplete file. */
+}
+
+static bool analyzerRejects(const std::string& path) {
+    std::string command = "python3 programs/vkd3d-fg-latency-analyze.py '" + path +
+            "' >/dev/null 2>&1";
+    return std::system(command.c_str()) != 0;
+}
+
+static void testIncompleteExplicitFinalizationOutput() {
+    for (bool duringFinalization : {false, true}) {
+        std::string path = tempPath(duringFinalization
+                ? "vkd3d-telemetry-interrupted-explicit.jsonl"
+                : "vkd3d-telemetry-abrupt-before-explicit.jsonl");
+        int ready[2] = {-1, -1};
+        check(pipe(ready) == 0, "could not create incomplete-capture synchronization pipe");
+        if (ready[0] < 0)
+            continue;
+        pid_t child = fork();
+        if (child == 0) {
+            close(ready[0]);
+            int result = incompleteFinalizeChild(path.c_str(), ready[1], duringFinalization);
+            _exit(result);
+        }
+        close(ready[1]);
+        std::string output;
+        bool reported = child > 0 && readLineWithTimeout(ready[0], &output);
+        close(ready[0]);
+        check(reported && !output.empty(), "incomplete-capture child did not report output path");
+        if (child > 0 && duringFinalization)
+            check(kill(child, SIGKILL) == 0, "could not interrupt explicit finalization child");
+        int status = 0;
+        if (child > 0)
+            waitpid(child, &status, 0);
+        if (reported && !output.empty()) {
+            auto lines = readLines(output);
+            check(countSummary(lines) == 0 && analyzerRejects(output),
+                    "incomplete explicit capture was accepted as complete by the analyzer");
+        }
+        testReset();
+    }
+}
+
 static void testMultiProcessOutputIdentity(const char *self) {
     std::string path = tempPath("vkd3d-telemetry-multiprocess-") +
             std::to_string(getpid()) + ".jsonl";
@@ -1276,6 +1513,11 @@ int main(int argc, char **argv) {
     testConcurrentInitializationAndIds();
     testOwnerLifecycle();
     testProcessFinalizerWithLiveOwners();
+    testExplicitFinalizeActiveProducer();
+    testExplicitFinalizeThenProcessPreExit();
+    testExplicitProcessPreExitRace();
+    testDuplicateExplicitFinalize();
+    testExplicitFinalizeIncompleteResult();
     testProcessPreExitTransientZeroOwners();
     testProcessPreExitAcquireRace();
     testProcessFinalizerOwnerRace();
@@ -1285,6 +1527,9 @@ int main(int argc, char **argv) {
     testDistinctOutputsDoNotTruncate();
 #ifndef _WIN32
     testMultiProcessOutputIdentity(argv[0]);
+    testIncompleteExplicitFinalizationOutput();
+#else
+    testPipeTransportRoundTrip();
 #endif
     int failureCount = failures.load(std::memory_order_relaxed);
     if (failureCount)

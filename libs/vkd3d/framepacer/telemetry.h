@@ -25,6 +25,16 @@ enum class InitializationFailure : uint8_t {
     WriterRuntime,
 };
 
+/* This is intentionally a result of an explicit finalization request, not a
+ * lifecycle state or a finalization authority. */
+enum class ExplicitFinalizeResult : uint8_t {
+    Success,
+    AlreadyFinalizing,
+    AlreadyFinalized,
+    Unavailable,
+    FailedIncomplete,
+};
+
 enum class Type : uint16_t { Pacing, Submit, Present, GpuFrontier, Prediction };
 enum class Phase : uint16_t { Complete, Wait, Decision, Sleep, DxgiEntry, VkPresent };
 enum class QueueRole : uint8_t { Normal, OobRender, OobPresent, Unknown };
@@ -83,7 +93,8 @@ public:
     /* The configured path is a base; an enabled session owns this unique output. */
     const std::string& outputPath() const { return m_outputPath; }
     bool publish(Event event);
-    void shutdown();
+    /* False means that the terminal writer/close contract was not met. */
+    bool shutdown();
     uint64_t dropped() const { return m_dropped.load(std::memory_order_relaxed); }
     uint64_t published() const { return m_published.load(std::memory_order_relaxed); }
     uint32_t capacity() const { return m_capacity; }
@@ -143,6 +154,8 @@ private:
     uint64_t m_startNs = 0;
     uint64_t m_runId = 0;
     bool m_writerStarted = false;
+    bool m_shutdownFinished = false;
+    bool m_terminalSucceeded = false;
     enum class WriterState : uint8_t { NotStarted, Starting, Running, Failed, Finished };
     std::atomic<WriterState> m_writerState = {WriterState::NotStarted};
     std::atomic<bool> m_globalActive = {false};
@@ -208,6 +221,7 @@ void testWaitGlobalWriterFailed();
 bool testInitializationComplete();
 uint32_t testInitializerEntryCount();
 void testProcessExitFinalizer();
+ExplicitFinalizeResult testExplicitFinalize();
 uint32_t testOwnerCount();
 bool testActive();
 bool testFinalized();

@@ -40,6 +40,13 @@ static std::mutex g_producerMutex;
 static std::condition_variable g_producerCond;
 static std::atomic<uint64_t> g_nextSwapchainId = {1};
 static std::atomic<uint64_t> g_nextDeviceId = {1};
+static ExplicitFinalizeResult explicitFinalize() noexcept;
+
+#ifdef _WIN32
+static std::atomic<bool> g_controlListenerStarted = {false};
+static void controlListener(std::string endpoint) noexcept;
+static void startControlListener(const char *token) noexcept;
+#endif
 
 #ifdef _WIN32
 typedef void (WINAPI *WinePreExitCallback)(void *);
@@ -576,26 +583,36 @@ void Session::deactivateGlobal() noexcept {
     m_globalActive.store(false, std::memory_order_release);
 }
 
-void Session::shutdown() {
+bool Session::shutdown() {
     std::lock_guard<std::mutex> shutdownLock(m_shutdownMutex);
+    if (m_shutdownFinished)
+        return m_terminalSucceeded;
+    m_shutdownFinished = true;
     if (!m_writerStarted && !m_slots)
-        return;
+        return false;
     m_producerState.fetch_or(ProducerClosed, std::memory_order_acq_rel);
     m_enabled.store(false, std::memory_order_release);
     waitForProducers();
     m_stop.store(true, std::memory_order_release);
     if (!m_writerStarted) {
         writerEntry();
-        m_file.reset();
+        FILE *file = m_file.release();
+        bool closeSucceeded = file && std::fclose(file) == 0;
         m_slots.reset();
-        return;
+        m_terminalSucceeded = closeSucceeded &&
+                m_writerState.load(std::memory_order_acquire) == WriterState::Finished;
+        return m_terminalSucceeded;
     }
     m_waitCond.notify_one();
     if (m_writer.joinable())
         m_writer.join();
     m_writerStarted = false;
-    m_file.reset();
+    FILE *file = m_file.release();
+    bool closeSucceeded = file && std::fclose(file) == 0;
     m_slots.reset();
+    m_terminalSucceeded = closeSucceeded &&
+            m_writerState.load(std::memory_order_acquire) == WriterState::Finished;
+    return m_terminalSucceeded;
 }
 
 #ifdef VKD3D_ENABLE_TEST_HOOKS
@@ -678,6 +695,11 @@ static bool initializeLocked(const std::string& path, uint32_t waitLatency,
         g_finalizationAuthority = FinalizationAuthority::LastOwnerFallback;
 #endif
         g_lifecycle.store(Lifecycle::Active, std::memory_order_release);
+#ifdef _WIN32
+        /* The control listener is opt-in and starts only after a usable output
+         * session has been published. */
+        startControlListener(std::getenv("VKD3D_FG_LATENCY_TELEMETRY_CONTROL"));
+#endif
         return true;
     } catch (...) {
         return false;
@@ -763,7 +785,7 @@ static bool claimFinalizationLocked() {
     return true;
 }
 
-static void completeFinalization() {
+static bool completeFinalization() {
     std::unique_ptr<Session> session;
 
 #ifdef VKD3D_ENABLE_TEST_HOOKS
@@ -778,15 +800,17 @@ static void completeFinalization() {
         g_session.store(nullptr, std::memory_order_release);
         session = std::move(g_sessionOwner);
     }
+    bool terminalSucceeded = false;
     if (session) {
         session->deactivateGlobal();
-        session->shutdown();
+        terminalSucceeded = session->shutdown();
     }
     {
         std::lock_guard<std::mutex> lock(g_sessionMutex);
         g_lifecycle.store(Lifecycle::Finalized, std::memory_order_release);
     }
     g_lifecycleCond.notify_all();
+    return terminalSucceeded;
 }
 
 void shutdown() {
@@ -812,6 +836,86 @@ void shutdown() {
     }
     completeFinalization();
 }
+
+/* Explicit capture finalization is an initiator competing for the one
+ * Active -> Finalizing claim. It is deliberately not an authority. */
+static ExplicitFinalizeResult explicitFinalize() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(g_sessionMutex);
+        switch (g_lifecycle.load(std::memory_order_relaxed)) {
+            case Lifecycle::Active:
+                if (!claimFinalizationLocked())
+                    return ExplicitFinalizeResult::AlreadyFinalizing;
+                break;
+            case Lifecycle::Finalizing:
+                return ExplicitFinalizeResult::AlreadyFinalizing;
+            case Lifecycle::Finalized:
+                return ExplicitFinalizeResult::AlreadyFinalized;
+            case Lifecycle::NeverInitialized:
+            case Lifecycle::Unavailable:
+                return ExplicitFinalizeResult::Unavailable;
+        }
+    }
+    return completeFinalization() ? ExplicitFinalizeResult::Success
+            : ExplicitFinalizeResult::FailedIncomplete;
+}
+
+#ifdef _WIN32
+static const char *explicitFinalizeResultName(ExplicitFinalizeResult result) {
+    switch (result) {
+        case ExplicitFinalizeResult::Success: return "SUCCESS\n";
+        case ExplicitFinalizeResult::AlreadyFinalizing: return "ALREADY_FINALIZING\n";
+        case ExplicitFinalizeResult::AlreadyFinalized: return "ALREADY_FINALIZED\n";
+        case ExplicitFinalizeResult::Unavailable: return "UNAVAILABLE\n";
+        case ExplicitFinalizeResult::FailedIncomplete: return "FAILED_INCOMPLETE\n";
+    }
+    return "FAILED_INCOMPLETE\n";
+}
+
+static void controlListener(std::string endpoint) noexcept {
+    HANDLE pipe = CreateNamedPipeA(endpoint.c_str(), PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 64, 64, 0, nullptr);
+    if (pipe == INVALID_HANDLE_VALUE)
+        return;
+    BOOL connected = ConnectNamedPipe(pipe, nullptr);
+    if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
+        CloseHandle(pipe);
+        return;
+    }
+    char request[32] = {};
+    DWORD received = 0;
+    ExplicitFinalizeResult result = ExplicitFinalizeResult::Unavailable;
+    if (ReadFile(pipe, request, sizeof(request) - 1, &received, nullptr) &&
+            (!std::strcmp(request, "FINALIZE") || !std::strcmp(request, "FINALIZE\n")))
+        result = explicitFinalize();
+    const char *reply = explicitFinalizeResultName(result);
+    DWORD ignored = 0;
+    WriteFile(pipe, reply, DWORD(std::strlen(reply)), &ignored, nullptr);
+    DisconnectNamedPipe(pipe);
+    CloseHandle(pipe);
+}
+
+static void startControlListener(const char *token) noexcept {
+    if (!token || !*token || g_controlListenerStarted.exchange(true, std::memory_order_acq_rel))
+        return;
+    /* The detached listener executes code in this module. Pin it until process
+     * teardown rather than ever depending on DLL_PROCESS_DETACH for a join. */
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            reinterpret_cast<LPCWSTR>(controlListener), &module))
+        return;
+    try {
+        std::string endpoint = "\\\\.\\pipe\\vkd3d-fg-latency-";
+        endpoint += token;
+        endpoint += "-";
+        endpoint += std::to_string(unsigned(get_process_id()));
+        std::thread(controlListener, std::move(endpoint)).detach();
+    } catch (...) {
+        FreeLibrary(module);
+        /* Telemetry remains usable when the optional experiment transport cannot start. */
+    }
+}
+#endif
 
 bool isEnabled() {
     return g_lifecycle.load(std::memory_order_acquire) == Lifecycle::Active &&
@@ -980,6 +1084,10 @@ uint32_t testInitializerEntryCount() {
 
 void testProcessExitFinalizer() {
     shutdown();
+}
+
+ExplicitFinalizeResult testExplicitFinalize() {
+    return explicitFinalize();
 }
 
 uint32_t testOwnerCount() {
