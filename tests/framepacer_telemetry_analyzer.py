@@ -65,6 +65,22 @@ def event(record_type, sequence, **values):
     return result
 
 
+def first_failure(sequence, **values):
+    result = event("FIRST_FAILURE", sequence, schema_version=3,
+                   phase="COMPLETE", flags=1,
+                   queue_role="UNKNOWN", capture_class="AMBIGUOUS")
+    result.update({
+        "failure_reason": "INVALID_PRESENT_ATTEMPT_ZERO_TOKEN",
+        "cpu_finished_watermark": 1, "gpu_finished_watermark": 1,
+        "context_id": 0, "context_value0": 5, "context_value1": 7,
+        "context_value2": 9, "context_count0": 0, "context_count1": 42,
+        "reflex_accounting_active": True, "present_token_provided": False,
+        "caller_token_thread_match": False,
+    })
+    result.update(values)
+    return result
+
+
 class AnalyzerValidationTests(unittest.TestCase):
     def test_unsupported_schema(self):
         result = run_capture([run_record(1), summary(0, schema=1)])
@@ -96,6 +112,32 @@ class AnalyzerValidationTests(unittest.TestCase):
         result = run_capture([run_record(), record, summary(1)])
         self.assertEqual(result.returncode, 2)
         self.assertIn("GPU_FRONTIER submit counts are not truthful", result.stderr)
+
+    def test_valid_first_failure_is_summarized_without_latency_causality(self):
+        failure = first_failure(1)
+        result = run_capture([run_record(3), failure, summary(1, schema=3)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FIRST_FAILURE: device=1 epoch=1 "
+                      "reason=INVALID_PRESENT_ATTEMPT_ZERO_TOKEN", result.stdout)
+
+    def test_first_failure_requires_reason(self):
+        failure = first_failure(1)
+        del failure["failure_reason"]
+        result = run_capture([run_record(3), failure, summary(1, schema=3)])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("missing required field failure_reason", result.stderr)
+
+    def test_duplicate_first_failure_is_rejected(self):
+        first = first_failure(1)
+        second = first_failure(2, failure_reason="COMPLETION_FAILURE")
+        result = run_capture([run_record(3), first, second, summary(2, schema=3)])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("duplicate FIRST_FAILURE", result.stderr)
+
+    def test_capture_without_first_failure_remains_valid(self):
+        result = run_capture([run_record(3), summary(0, schema=3)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FIRST_FAILURE: none", result.stdout)
 
     def test_disabled_legacy_completion_keeps_the_layer_one_locking_path(self):
         with open(os.path.join(ROOT, "libs", "vkd3d", "framepacer", "command_queue.h"),

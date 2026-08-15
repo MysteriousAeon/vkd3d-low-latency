@@ -67,10 +67,99 @@ namespace pacer {
         return entry != m_captures.end() ? &entry->second : nullptr;
     }
 
-    void SimulationLedger::markTrackingFailureLocked(SimulationRecord* simulation) {
+    FirstFailureContext SimulationLedger::contextForSimulation(
+            const SimulationRecord* simulation) const {
+        FirstFailureContext context;
+        if (simulation) {
+            context.simulationId = simulation->simulationId;
+            context.externalReflexId = simulation->externalReflexId;
+        }
+        return context;
+    }
+
+    FirstFailureContext SimulationLedger::contextForCapture(
+            const CaptureRecord* capture) const {
+        FirstFailureContext context;
+        if (capture) {
+            context.simulationId = capture->simulationId;
+            context.captureGeneration = capture->captureGeneration;
+            context.externalReflexId = capture->externalReflexId;
+        }
+        return context;
+    }
+
+    telemetry::FailureReason SimulationLedger::firstFailureReason(
+            CaptureFailureReason reason) const {
+        switch (reason) {
+            case CaptureFailureReason::InvalidStart:
+            case CaptureFailureReason::DuplicateStart:
+                return telemetry::FailureReason::InvalidRenderStart;
+            case CaptureFailureReason::InvalidEnd:
+                return telemetry::FailureReason::InvalidRenderEnd;
+            case CaptureFailureReason::NoOpenCapture:
+            case CaptureFailureReason::AmbiguousOpenCaptures:
+                return telemetry::FailureReason::CaptureAcquireFailure;
+            case CaptureFailureReason::TokenMismatch:
+            case CaptureFailureReason::CommitToRetired:
+                return telemetry::FailureReason::CaptureLeaseIdentityFailure;
+            case CaptureFailureReason::SubmitSlotUnavailable:
+                return telemetry::FailureReason::SubmitOrCaptureSealFailure;
+            case CaptureFailureReason::PresentWithoutCapture:
+                return telemetry::FailureReason::PresentRecordFailure;
+            case CaptureFailureReason::PresentCancelled:
+                return telemetry::FailureReason::PresentCancelFailure;
+            case CaptureFailureReason::None:
+            case CaptureFailureReason::EpochTransition:
+                return telemetry::FailureReason::ExplicitForceOrOther;
+        }
+        return telemetry::FailureReason::ExplicitForceOrOther;
+    }
+
+    bool SimulationLedger::claimPacingBypassLocked(telemetry::FailureReason reason,
+            const FirstFailureContext& context) {
+        if (!m_epochActive) {
+            /* Preserve the legacy inactive/shutdown store without diagnosing it. */
+            m_bypassPacing.store(true, std::memory_order_release);
+            return false;
+        }
+
+        bool expected = false;
+        if (!m_bypassPacing.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            return false;
+
+        if (telemetry::isEnabled()) {
+            telemetry::Event event;
+            event.type = telemetry::Type::FirstFailure;
+            event.failureReason = reason;
+            event.deviceId = m_telemetryDeviceId;
+            event.epochId = m_activeEpoch;
+            event.simulationId = context.simulationId;
+            event.externalReflexId = context.externalReflexId;
+            event.captureGeneration = context.captureGeneration;
+            event.id0 = m_cpuWatermark;
+            event.id1 = m_gpuWatermark;
+            event.id2 = context.contextId;
+            event.timestamp0 = context.contextValue0;
+            event.timestamp1 = context.contextValue1;
+            event.timestamp2 = context.contextValue2;
+            event.count0 = context.contextCount0;
+            event.count1 = context.contextCount1;
+            event.flags = context.flags |
+                    telemetry::FirstFailureReflexAccountingActive;
+            telemetry::emit(event);
+        }
+        return true;
+    }
+
+    void SimulationLedger::markTrackingFailureLocked(SimulationRecord* simulation,
+            telemetry::FailureReason reason, const FirstFailureContext& context) {
         if (simulation)
             simulation->trackingFailed = true;
-        m_bypassPacing.store(true, std::memory_order_release);
+        FirstFailureContext resolved = context;
+        if (!resolved.simulationId && simulation)
+            resolved = contextForSimulation(simulation);
+        claimPacingBypassLocked(reason, resolved);
     }
 
     void SimulationLedger::failCaptureLocked(CaptureRecord& capture,
@@ -83,12 +172,14 @@ namespace pacer {
         capture.submissionSealRequested = true;
         m_openCaptures.erase(capture.captureGeneration);
         SimulationRecord* simulation = findSimulationLocked(capture.simulationId);
-        markTrackingFailureLocked(simulation);
+        markTrackingFailureLocked(simulation, firstFailureReason(reason),
+                contextForCapture(&capture));
         if (simulation)
             finalizeSubmissionSealLocked(*simulation, &capture);
     }
 
-    void SimulationLedger::markUntrustedFrontierLocked(CaptureFailureReason reason) {
+    void SimulationLedger::markUntrustedFrontierLocked(CaptureFailureReason reason,
+            const FirstFailureContext& context) {
         for (auto& entry : m_simulations) {
             SimulationRecord& simulation = entry.second;
             if (simulation.simulationId > m_gpuWatermark)
@@ -103,7 +194,7 @@ namespace pacer {
                 m_openCaptures.erase(generation);
         }
         if (m_epochActive)
-            m_bypassPacing.store(true, std::memory_order_release);
+            claimPacingBypassLocked(firstFailureReason(reason), context);
     }
 
     uint64_t SimulationLedger::beginSimulation(uint64_t accountingEpoch,
@@ -135,8 +226,11 @@ namespace pacer {
         std::lock_guard<dxvk::mutex> lock(m_mutex);
         if (!m_epochActive || accountingEpoch != m_activeEpoch)
             return;
+        FirstFailureContext context;
+        context.externalReflexId = externalReflexId;
+        context.contextId = externalReflexId;
         if (!externalReflexId) {
-            markUntrustedFrontierLocked(CaptureFailureReason::InvalidStart);
+            markUntrustedFrontierLocked(CaptureFailureReason::InvalidStart, context);
             return;
         }
 
@@ -145,7 +239,7 @@ namespace pacer {
          * permanent replay guard; heavyweight associations are only needed
          * while exact capture ownership can still be affected. */
         if (externalReflexId <= m_highestStartedExternalId) {
-            markUntrustedFrontierLocked(CaptureFailureReason::DuplicateStart);
+            markUntrustedFrontierLocked(CaptureFailureReason::DuplicateStart, context);
             return;
         }
         auto mapping = m_externalMappings.find(externalReflexId);
@@ -153,7 +247,7 @@ namespace pacer {
                 ? findSimulationLocked(mapping->second) : nullptr;
         if (!simulation || simulation->accountingEpoch != accountingEpoch ||
                 simulation->submissionsSealed || simulation->trackingFailed) {
-            markUntrustedFrontierLocked(CaptureFailureReason::InvalidStart);
+            markUntrustedFrontierLocked(CaptureFailureReason::InvalidStart, context);
             return;
         }
 
@@ -180,13 +274,16 @@ namespace pacer {
         std::lock_guard<dxvk::mutex> lock(m_mutex);
         if (!m_epochActive || accountingEpoch != m_activeEpoch)
             return {};
+        FirstFailureContext context;
+        context.externalReflexId = externalReflexId;
+        context.contextId = externalReflexId;
         auto association = m_endAssociations.find(externalReflexId);
         if (association == m_endAssociations.end() ||
                 association->second.accountingEpoch != accountingEpoch) {
             if (externalReflexId &&
                     externalReflexId <= m_highestStartedExternalId)
                 return collectProgressLocked();
-            markUntrustedFrontierLocked(CaptureFailureReason::InvalidEnd);
+            markUntrustedFrontierLocked(CaptureFailureReason::InvalidEnd, context);
             return collectProgressLocked();
         }
         if (association->second.state == EndAssociationState::Consumed)
@@ -199,7 +296,7 @@ namespace pacer {
         if (capture &&
                 (capture->simulationId != association->second.simulationId ||
                  capture->externalReflexId != externalReflexId)) {
-            markUntrustedFrontierLocked(CaptureFailureReason::InvalidEnd);
+            markUntrustedFrontierLocked(CaptureFailureReason::InvalidEnd, context);
             return collectProgressLocked();
         }
 
@@ -214,7 +311,7 @@ namespace pacer {
             return collectProgressLocked();
         }
         if (!simulation || capture->state != CaptureState::Open) {
-            markUntrustedFrontierLocked(CaptureFailureReason::InvalidEnd);
+            markUntrustedFrontierLocked(CaptureFailureReason::InvalidEnd, context);
             return collectProgressLocked();
         }
 
@@ -272,9 +369,18 @@ namespace pacer {
         if (!m_epochActive || token.accountingEpoch != m_activeEpoch)
             return false;
 
+        FirstFailureContext tokenContext;
+        tokenContext.simulationId = token.simulationId;
+        tokenContext.captureGeneration = token.captureGeneration;
+        tokenContext.externalReflexId = token.externalReflexId;
+        tokenContext.contextId = token.publicationLeaseId;
+        tokenContext.contextValue0 = commandGeneration;
+
         auto lease = m_activePublicationLeases.find(token.publicationLeaseId);
         if (lease == m_activePublicationLeases.end()) {
-            markUntrustedFrontierLocked(CaptureFailureReason::TokenMismatch);
+            claimPacingBypassLocked(
+                    telemetry::FailureReason::CaptureLeaseIdentityFailure, tokenContext);
+            markUntrustedFrontierLocked(CaptureFailureReason::TokenMismatch, tokenContext);
             return false;
         }
         const CaptureToken actual = lease->second;
@@ -286,9 +392,13 @@ namespace pacer {
                 actual.publicationLeaseId == token.publicationLeaseId;
 
         if (!identityMatches) {
+            tokenContext.contextValue1 = actual.captureGeneration;
+            tokenContext.contextValue2 = actual.simulationId;
+            claimPacingBypassLocked(
+                    telemetry::FailureReason::CaptureLeaseIdentityFailure, tokenContext);
             if (capture)
                 failCaptureLocked(*capture, CaptureFailureReason::TokenMismatch);
-            markUntrustedFrontierLocked(CaptureFailureReason::TokenMismatch);
+            markUntrustedFrontierLocked(CaptureFailureReason::TokenMismatch, tokenContext);
             commit = false;
         }
 
@@ -362,7 +472,8 @@ namespace pacer {
         if (!simulation.submissionsSealed)
             simulation.submissionsSealed = true;
         if (!simulation.publishedSubmits)
-            markTrackingFailureLocked(&simulation);
+            markTrackingFailureLocked(&simulation,
+                    telemetry::FailureReason::SubmitOrCaptureSealFailure);
         if (capture->state == CaptureState::Closing)
             capture->state = CaptureState::Retired;
     }
@@ -398,7 +509,9 @@ namespace pacer {
                         if (capture.state == CaptureState::Retired) {
                             capture.state = CaptureState::Failed;
                             capture.failureReason = reason;
-                            markTrackingFailureLocked(&simulation);
+                            markTrackingFailureLocked(&simulation,
+                                    firstFailureReason(reason),
+                                    contextForCapture(&capture));
                         } else
                             failCaptureLocked(capture, reason);
                     }
@@ -409,7 +522,8 @@ namespace pacer {
         }
         if (!found || !simulation.renderCaptureOpened) {
             simulation.submissionsSealed = true;
-            markTrackingFailureLocked(&simulation);
+            markTrackingFailureLocked(&simulation,
+                    telemetry::FailureReason::PresentStartFailure);
         }
     }
 
@@ -430,7 +544,8 @@ namespace pacer {
         if (ownership.presentPending)
             cancelPresentLocked(ownership);
         if (!simulation) {
-            markTrackingFailureLocked(nullptr);
+            markTrackingFailureLocked(nullptr,
+                    telemetry::FailureReason::PresentStartFailure);
             ownership.presentSimulationId = 0;
             return collectProgressLocked();
         }
@@ -462,9 +577,11 @@ namespace pacer {
             }
             closeOpenCapturesForPresentLocked(*simulation, true,
                     CaptureFailureReason::PresentCancelled);
-            markTrackingFailureLocked(simulation);
+            markTrackingFailureLocked(simulation,
+                    telemetry::FailureReason::PresentCancelFailure);
         } else {
-            markTrackingFailureLocked(nullptr);
+            markTrackingFailureLocked(nullptr,
+                    telemetry::FailureReason::PresentCancelFailure);
         }
         ownership.presentPending = false;
         ownership.presentAccepted = false;
@@ -517,7 +634,8 @@ namespace pacer {
                 ownership->second.presentPending)
             cancelPresentLocked(ownership->second);
         else
-            markTrackingFailureLocked(nullptr);
+            markTrackingFailureLocked(nullptr,
+                    telemetry::FailureReason::PresentCancelFailure);
         return collectProgressLocked();
     }
 
@@ -540,14 +658,26 @@ namespace pacer {
         *rollbackVulkanGeneration = submit.vulkanGeneration;
         if (submit.completionAccounted ||
                 submit.vulkanGeneration) {
-            markTrackingFailureLocked(findSimulationLocked(submit.simulationId));
+            FirstFailureContext context;
+            context.simulationId = submit.simulationId;
+            context.captureGeneration = submit.captureGeneration;
+            context.contextValue0 = commandGeneration;
+            context.contextValue1 = vulkanGeneration;
+            markTrackingFailureLocked(findSimulationLocked(submit.simulationId),
+                    telemetry::FailureReason::VulkanPublicationFailure, context);
             return SubmitPublicationResult::Rejected;
         }
         if (!m_epochActive || submit.accountingEpoch != m_activeEpoch)
             return SubmitPublicationResult::Rejected;
         SimulationRecord* simulation = findSimulationLocked(submit.simulationId);
         if (!simulation) {
-            markTrackingFailureLocked(nullptr);
+            FirstFailureContext context;
+            context.simulationId = submit.simulationId;
+            context.captureGeneration = submit.captureGeneration;
+            context.contextValue0 = commandGeneration;
+            context.contextValue1 = vulkanGeneration;
+            markTrackingFailureLocked(nullptr,
+                    telemetry::FailureReason::VulkanPublicationFailure, context);
             return SubmitPublicationResult::Rejected;
         }
         submit.vulkanQueue = vulkanQueue;
@@ -611,12 +741,24 @@ namespace pacer {
             return {};
         SimulationRecord* simulation = findSimulationLocked(submit.simulationId);
         if (!simulation) {
-            markTrackingFailureLocked(nullptr);
+            FirstFailureContext context;
+            context.simulationId = submit.simulationId;
+            context.captureGeneration = submit.captureGeneration;
+            context.contextValue0 = commandGeneration;
+            context.contextValue1 = vulkanGeneration;
+            markTrackingFailureLocked(nullptr,
+                    telemetry::FailureReason::CompletionFailure, context);
             return {};
         }
         simulation->accountedSubmits++;
-        if (!gpuTimestamp)
-            markTrackingFailureLocked(simulation);
+        if (!gpuTimestamp) {
+            FirstFailureContext context = contextForSimulation(simulation);
+            context.captureGeneration = submit.captureGeneration;
+            context.contextValue0 = commandGeneration;
+            context.contextValue1 = vulkanGeneration;
+            markTrackingFailureLocked(simulation,
+                    telemetry::FailureReason::CompletionFailure, context);
+        }
         else {
             simulation->completedSubmits++;
             simulation->gpuTimestamp = std::max(simulation->gpuTimestamp, gpuTimestamp);
@@ -642,9 +784,21 @@ namespace pacer {
         SimulationRecord* simulation = findSimulationLocked(submit.simulationId);
         if (simulation) {
             simulation->accountedSubmits++;
-            markTrackingFailureLocked(simulation);
-        } else
-            markTrackingFailureLocked(nullptr);
+            FirstFailureContext context = contextForSimulation(simulation);
+            context.captureGeneration = submit.captureGeneration;
+            context.contextValue0 = commandGeneration;
+            context.contextValue1 = vulkanGeneration;
+            markTrackingFailureLocked(simulation,
+                    telemetry::FailureReason::AbandonedCapturedSubmit, context);
+        } else {
+            FirstFailureContext context;
+            context.simulationId = submit.simulationId;
+            context.captureGeneration = submit.captureGeneration;
+            context.contextValue0 = commandGeneration;
+            context.contextValue1 = vulkanGeneration;
+            markTrackingFailureLocked(nullptr,
+                    telemetry::FailureReason::AbandonedCapturedSubmit, context);
+        }
         return collectProgressLocked();
     }
 
@@ -663,10 +817,16 @@ namespace pacer {
                 ? findSimulationLocked(ownership->second.presentSimulationId) : nullptr;
         uint64_t& lastSequence = m_swapchainSequences[swapchain];
         if (!simulation || !sequence || sequence <= lastSequence) {
+            FirstFailureContext context;
+            context.simulationId = attemptToken.simulationId;
+            context.contextId = attemptToken.attemptGeneration;
+            context.contextValue0 = attemptToken.accountingEpoch;
+            context.contextValue1 = sequence;
+            context.contextCount0 = attemptToken.threadId;
+            markTrackingFailureLocked(simulation,
+                    telemetry::FailureReason::PresentRecordFailure, context);
             if (simulation)
                 cancelPresentLocked(ownership->second);
-            else
-                markTrackingFailureLocked(nullptr);
             return collectProgressLocked();
         }
 
@@ -687,6 +847,11 @@ namespace pacer {
     void SimulationLedger::unregisterSwapchain(void* swapchain) {
         std::lock_guard<dxvk::mutex> lock(m_mutex);
         m_swapchainSequences.erase(swapchain);
+    }
+
+    void SimulationLedger::setTelemetryDeviceId(uint64_t deviceId) {
+        std::lock_guard<dxvk::mutex> lock(m_mutex);
+        m_telemetryDeviceId = deviceId;
     }
 
     SimulationProgress SimulationLedger::collectProgressLocked() {
@@ -784,8 +949,10 @@ namespace pacer {
         return m_bypassPacing.load(std::memory_order_acquire);
     }
 
-    void SimulationLedger::forcePacingBypass() {
-        m_bypassPacing.store(true, std::memory_order_release);
+    bool SimulationLedger::forcePacingBypass(telemetry::FailureReason reason,
+            const FirstFailureContext& context) {
+        std::lock_guard<dxvk::mutex> lock(m_mutex);
+        return claimPacingBypassLocked(reason, context);
     }
 
 #ifdef VKD3D_ENABLE_TEST_HOOKS

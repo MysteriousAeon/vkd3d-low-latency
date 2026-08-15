@@ -1,4 +1,5 @@
 #include "framepacer/framepacer_bridge.h"
+#include "framepacer/simulation_ledger.h"
 #include "framepacer/telemetry.h"
 #include "vkd3d_dxgi1_2.h"
 #include "vkd3d_test_hooks.h"
@@ -1774,6 +1775,148 @@ static void run_telemetry_completion_identity_case()
     std::printf("telemetry-completion: accepted completion, generation role, and frontier counts stayed exact under a forced duplicate race.\n");
 }
 
+static unsigned count_text(const std::string& text, const char *needle)
+{
+    unsigned count = 0;
+    size_t position = 0;
+    while ((position = text.find(needle, position)) != std::string::npos)
+    {
+        count++;
+        position += std::strlen(needle);
+    }
+    return count;
+}
+
+static void run_first_failure_telemetry_case()
+{
+#ifdef _WIN32
+    const char *path = "Z:\\tmp\\vkd3d-first-failure.jsonl";
+#else
+    const char *path = "/tmp/vkd3d-first-failure.jsonl";
+#endif
+    std::remove(path);
+    check(pacer::telemetry::testInitialize(path, 3, 64),
+            "first-failure: failed to initialize telemetry session.\n");
+    std::string output_path = pacer::telemetry::testOutputPath();
+
+    pacer::SimulationLedger ledger(2);
+    ledger.setTelemetryDeviceId(99);
+    pacer::FirstFailureContext single = {};
+    single.simulationId = 2;
+    single.captureGeneration = 7;
+    single.contextId = 11;
+
+    ledger.activateEpoch(41, 2);
+    check(ledger.forcePacingBypass(pacer::telemetry::FailureReason::InvalidRenderEnd,
+                    single) && ledger.shouldBypassPacing(),
+            "first-failure: initial failure did not own the healthy latch.\n");
+    check(!ledger.forcePacingBypass(pacer::telemetry::FailureReason::CompletionFailure,
+                    single),
+            "first-failure: duplicate failure replaced the latch owner.\n");
+
+    ledger.activateEpoch(43, 2);
+    check(ledger.forcePacingBypass(pacer::telemetry::FailureReason::CompletionFailure,
+                    single),
+            "first-failure: activateEpoch did not reset one-shot eligibility.\n");
+
+    ledger.activateEpoch(45, 2);
+    ledger.deactivateEpoch(45);
+    check(ledger.shouldBypassPacing(),
+            "first-failure: normal deactivation no longer bypasses pacing.\n");
+
+    ledger.activateEpoch(47, 2);
+    std::atomic<bool> concurrent_start = { false };
+    std::atomic<unsigned> concurrent_winners = { 0 };
+    std::atomic<bool> render_won = { false };
+    std::atomic<bool> completion_won = { false };
+    std::thread render_failure([&]() {
+        while (!concurrent_start.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        bool won = ledger.forcePacingBypass(
+                pacer::telemetry::FailureReason::InvalidRenderStart, single);
+        render_won.store(won, std::memory_order_release);
+        if (won)
+            concurrent_winners.fetch_add(1, std::memory_order_relaxed);
+    });
+    std::thread completion_failure([&]() {
+        while (!concurrent_start.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        bool won = ledger.forcePacingBypass(
+                pacer::telemetry::FailureReason::CompletionFailure, single);
+        completion_won.store(won, std::memory_order_release);
+        if (won)
+            concurrent_winners.fetch_add(1, std::memory_order_relaxed);
+    });
+    concurrent_start.store(true, std::memory_order_release);
+    render_failure.join();
+    completion_failure.join();
+    check(concurrent_winners.load(std::memory_order_acquire) == 1 &&
+            ledger.shouldBypassPacing(),
+            "first-failure: concurrent false-to-true transition had %u winners.\n",
+            concurrent_winners.load(std::memory_order_relaxed));
+
+    ledger.activateEpoch(49, 2);
+    ledger.openRenderCapture(49, 0, 1, 0);
+    check(ledger.shouldBypassPacing(),
+            "first-failure: ledger-owned invalid START did not preserve bypass.\n");
+
+    {
+        fixture f(true, true);
+        pacer_present_attempt_token zero = {};
+        pacer_notify_present(f.device, &f.swapchain_token, 77, zero, 123);
+        check(f.snapshot().tracking_bypassed,
+                "first-failure: zero Present token did not preserve persistent bypass.\n");
+    }
+    pacer::telemetry::shutdown();
+
+    std::ifstream stream(output_path);
+    std::string line;
+    std::string first_failures;
+    std::string concurrent_failure;
+    while (std::getline(stream, line))
+    {
+        if (line.find("\"record_type\":\"FIRST_FAILURE\"") != std::string::npos)
+        {
+            first_failures += line + "\n";
+            if (line.find("\"epoch_id\":47") != std::string::npos)
+                concurrent_failure = line;
+        }
+    }
+    check(count_text(first_failures, "\"record_type\":\"FIRST_FAILURE\"") == 5,
+            "first-failure: expected exactly five first-failure records, got %u.\n",
+            count_text(first_failures, "\"record_type\":\"FIRST_FAILURE\""));
+    check(count_text(first_failures, "\"epoch_id\":41") == 1 &&
+            first_failures.find("\"epoch_id\":41") != std::string::npos &&
+            first_failures.find("\"failure_reason\":\"INVALID_RENDER_END\"") !=
+                    std::string::npos,
+            "first-failure: initial reason/context was not retained.\n");
+    check(count_text(first_failures, "\"epoch_id\":43") == 1 &&
+            count_text(first_failures, "\"epoch_id\":45") == 0,
+            "first-failure: epoch reset or deactivation one-shot handling was wrong.\n");
+    check((render_won.load(std::memory_order_acquire) &&
+            concurrent_failure.find("\"failure_reason\":\"INVALID_RENDER_START\"") !=
+                    std::string::npos) ||
+            (completion_won.load(std::memory_order_acquire) &&
+            concurrent_failure.find("\"failure_reason\":\"COMPLETION_FAILURE\"") !=
+                    std::string::npos),
+            "first-failure: concurrent telemetry reason was not owned by the CAS winner.\n");
+    check(first_failures.find("\"epoch_id\":49") != std::string::npos &&
+            first_failures.find("\"failure_reason\":\"INVALID_RENDER_START\"") !=
+                    std::string::npos,
+            "first-failure: ledger-owned tracking failure lacked its distinct reason.\n");
+    check(first_failures.find("\"failure_reason\":\"INVALID_PRESENT_ATTEMPT_ZERO_TOKEN\"") !=
+                    std::string::npos &&
+            first_failures.find("\"reflex_accounting_active\":true") !=
+                    std::string::npos &&
+            first_failures.find("\"present_token_provided\":false") !=
+                    std::string::npos &&
+            first_failures.find("\"context_value0\":0,\"context_value1\":77") !=
+                    std::string::npos,
+            "first-failure: zero Present token was not diagnosed with active Reflex context.\n");
+    pacer::telemetry::testReset();
+    std::printf("first-failure: one-shot, concurrent, epoch, zero-token, and ledger failure telemetry validated.\n");
+}
+
 static fixture::submit_pair submit_telemetry_captured(fixture& f,
         uint64_t publication_timestamp, uint64_t gpu_start)
 {
@@ -2779,6 +2922,7 @@ int main()
     run_command_ring_iterator_case();
     run_telemetry_completion_identity_case();
     run_telemetry_completion_metadata_lifetime_case();
+    run_first_failure_telemetry_case();
 
     if (failures)
     {

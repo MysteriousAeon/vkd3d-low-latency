@@ -2,6 +2,7 @@
 
 #include "util/util_time.h"
 #include "util/thread.h"
+#include "telemetry.h"
 
 #include <atomic>
 #include <cstdint>
@@ -187,6 +188,21 @@ namespace pacer {
         std::vector<GpuCompletion> gpu;
     };
 
+    /* Fixed-size first-failure context. The common telemetry Event keeps these
+     * fields generic so ordinary tracking paths do not need bespoke snapshots. */
+    struct FirstFailureContext {
+        uint64_t simulationId = 0;
+        uint64_t captureGeneration = 0;
+        uint64_t externalReflexId = 0;
+        uint64_t contextId = 0;
+        uint64_t contextValue0 = 0;
+        uint64_t contextValue1 = 0;
+        uint64_t contextValue2 = 0;
+        uint32_t contextCount0 = 0;
+        uint32_t contextCount1 = 0;
+        uint32_t flags = 0;
+    };
+
 #ifdef VKD3D_ENABLE_TEST_HOOKS
     struct CaptureSnapshot {
         uint64_t accountingEpoch = 0;
@@ -264,8 +280,14 @@ namespace pacer {
                 void* swapchain, uint64_t sequence);
         void unregisterSwapchain(void* swapchain);
 
+        void setTelemetryDeviceId(uint64_t deviceId);
+
         bool shouldBypassPacing() const;
-        void forcePacingBypass();
+        /* This path serializes its context snapshot with normal ledger work,
+         * then the CAS determines the sole first-failure owner. */
+        bool forcePacingBypass(telemetry::FailureReason reason =
+                telemetry::FailureReason::ExplicitForceOrOther,
+                const FirstFailureContext& context = {});
 
 #ifdef VKD3D_ENABLE_TEST_HOOKS
         bool testSubmitPending(const SubmitRecord& submit, void* commandQueue,
@@ -290,8 +312,17 @@ namespace pacer {
 
         SimulationRecord* findSimulationLocked(uint64_t simulationId);
         CaptureRecord* findCaptureLocked(uint64_t captureGeneration);
-        void markTrackingFailureLocked(SimulationRecord* simulation);
-        void markUntrustedFrontierLocked(CaptureFailureReason reason);
+        FirstFailureContext contextForSimulation(const SimulationRecord* simulation) const;
+        FirstFailureContext contextForCapture(const CaptureRecord* capture) const;
+        telemetry::FailureReason firstFailureReason(CaptureFailureReason reason) const;
+        bool claimPacingBypassLocked(telemetry::FailureReason reason,
+                const FirstFailureContext& context);
+        void markTrackingFailureLocked(SimulationRecord* simulation,
+                telemetry::FailureReason reason =
+                        telemetry::FailureReason::ExplicitForceOrOther,
+                const FirstFailureContext& context = {});
+        void markUntrustedFrontierLocked(CaptureFailureReason reason,
+                const FirstFailureContext& context = {});
         void failCaptureLocked(CaptureRecord& capture, CaptureFailureReason reason);
         void cancelPresentLocked(ThreadPresentOwnership& ownership);
         void requestSubmissionSealLocked(SimulationRecord& simulation,
@@ -324,6 +355,7 @@ namespace pacer {
         uint64_t m_nextPresentAttemptGeneration = 1;
         uint64_t m_activeEpoch = 0;
         uint64_t m_highestStartedExternalId = 0;
+        uint64_t m_telemetryDeviceId = 0;
         bool m_epochActive = false;
         std::atomic<bool> m_bypassPacing = { false };
     };

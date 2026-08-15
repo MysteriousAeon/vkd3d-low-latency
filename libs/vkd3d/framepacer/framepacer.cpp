@@ -42,6 +42,7 @@ namespace pacer {
 
         telemetry::initialize(m_frameSync.m_waitLatency);
         m_device->m_telemetryId = telemetry::allocateDeviceId();
+        m_simulationLedger.setTelemetryDeviceId(m_device->m_telemetryId);
         m_telemetryOwner.acquire();
 
         // todo: add env var mode selection
@@ -225,10 +226,11 @@ namespace pacer {
                 attemptToken));
     }
 
-    void FramePacer::forceReflexPacingBypass() {
+    void FramePacer::forceReflexPacingBypass(telemetry::FailureReason reason,
+            const FirstFailureContext& context) {
         std::lock_guard<dxvk::mutex> lock(m_progressMutex);
         if (isReflexAccountingState(getAccountingState()))
-            m_simulationLedger.forcePacingBypass();
+            m_simulationLedger.forcePacingBypass(reason, context);
     }
 
     SubmitCompletionResult FramePacer::accountReflexCompletion(SubmitRecord& submit,

@@ -350,8 +350,33 @@ static const char *typeName(Type type) {
         case Type::Present: return "PRESENT";
         case Type::GpuFrontier: return "GPU_FRONTIER";
         case Type::Prediction: return "PREDICTION";
+        case Type::FirstFailure: return "FIRST_FAILURE";
     }
     return "UNKNOWN";
+}
+
+static const char *failureReasonName(FailureReason reason) {
+    switch (reason) {
+        case FailureReason::None: return "NONE";
+        case FailureReason::InvalidRenderStart: return "INVALID_RENDER_START";
+        case FailureReason::InvalidRenderEnd: return "INVALID_RENDER_END";
+        case FailureReason::CaptureAcquireFailure: return "CAPTURE_ACQUIRE_FAILURE";
+        case FailureReason::CaptureLeaseIdentityFailure: return "CAPTURE_LEASE_IDENTITY_FAILURE";
+        case FailureReason::SubmitOrCaptureSealFailure: return "SUBMIT_OR_CAPTURE_SEAL_FAILURE";
+        case FailureReason::PresentStartFailure: return "PRESENT_START_FAILURE";
+        case FailureReason::PresentCancelFailure: return "PRESENT_CANCEL_FAILURE";
+        case FailureReason::PresentRecordFailure: return "PRESENT_RECORD_FAILURE";
+        case FailureReason::VulkanPublicationFailure: return "VULKAN_PUBLICATION_FAILURE";
+        case FailureReason::CompletionFailure: return "COMPLETION_FAILURE";
+        case FailureReason::AbandonedCapturedSubmit: return "ABANDONED_CAPTURED_SUBMIT";
+        case FailureReason::BridgeCaptureException: return "BRIDGE_CAPTURE_EXCEPTION";
+        case FailureReason::BridgeMarkerException: return "BRIDGE_MARKER_EXCEPTION";
+        case FailureReason::InvalidPresentAttemptZeroToken: return "INVALID_PRESENT_ATTEMPT_ZERO_TOKEN";
+        case FailureReason::InvalidPresentAttemptThreadMismatch: return "INVALID_PRESENT_ATTEMPT_THREAD_MISMATCH";
+        case FailureReason::InvalidAbortedPresentToken: return "INVALID_ABORTED_PRESENT_TOKEN";
+        case FailureReason::ExplicitForceOrOther: return "EXPLICIT_FORCE_OR_OTHER";
+    }
+    return "EXPLICIT_FORCE_OR_OTHER";
 }
 
 static const char *phaseName(Phase phase) {
@@ -430,7 +455,24 @@ void Session::writeEvent(const Event& e, std::string& out) {
             queueRoleName(e.queueRole), captureClassName(e.captureClass));
     out.append(line, size_t(n));
 
-    if (e.type == Type::Pacing && e.phase == Phase::Wait) {
+    if (e.type == Type::FirstFailure) {
+        std::snprintf(line, sizeof(line),
+                ",\"failure_reason\":\"%s\",\"cpu_finished_watermark\":%" PRIu64
+                ",\"gpu_finished_watermark\":%" PRIu64
+                ",\"context_id\":%" PRIu64
+                ",\"context_value0\":%" PRIu64
+                ",\"context_value1\":%" PRIu64
+                ",\"context_value2\":%" PRIu64
+                ",\"context_count0\":%u,\"context_count1\":%u"
+                ",\"reflex_accounting_active\":%s,\"present_token_provided\":%s"
+                ",\"caller_token_thread_match\":%s",
+                failureReasonName(e.failureReason), e.id0, e.id1, e.id2,
+                e.timestamp0, e.timestamp1, e.timestamp2, e.count0, e.count1,
+                (e.flags & FirstFailureReflexAccountingActive) ? "true" : "false",
+                (e.flags & FirstFailurePresentTokenProvided) ? "true" : "false",
+                (e.flags & FirstFailureCallerTokenThreadMatch) ? "true" : "false");
+        out += line;
+    } else if (e.type == Type::Pacing && e.phase == Phase::Wait) {
         std::snprintf(line, sizeof(line),
                 ",\"latency_sleep_entry_ns\":%" PRIu64 ",\"wait_id\":%" PRIu64
                 ",\"wait_latency\":%u,\"gpu_finished_at_entry\":%" PRIu64

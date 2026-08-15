@@ -116,8 +116,8 @@ pacer_command_capture_lease pacer_command_queue_acquire_capture(
         lease.token = export_capture_token(acquisition.token);
         lease.active = acquisition.result == CaptureAcquireResult::Acquired;
     } catch (...) {
-        COMMAND_QUEUE(command_queue)->m_device->m_pacer->m_simulationLedger
-                .forcePacingBypass();
+        COMMAND_QUEUE(command_queue)->m_device->m_pacer->forceReflexPacingBypass(
+                telemetry::FailureReason::BridgeCaptureException);
         lease.acquire_result = PACER_CAPTURE_NO_OPEN;
     }
     return lease;
@@ -137,8 +137,13 @@ uint64_t pacer_command_queue_commit_capture(
     try {
         result = COMMAND_QUEUE(command_queue)->commitCapturedSubmit(token);
     } catch (...) {
-        COMMAND_QUEUE(command_queue)->m_device->m_pacer->m_simulationLedger
-                .forcePacingBypass();
+        FirstFailureContext context;
+        context.simulationId = token.simulationId;
+        context.captureGeneration = token.captureGeneration;
+        context.externalReflexId = token.externalReflexId;
+        context.contextId = token.publicationLeaseId;
+        COMMAND_QUEUE(command_queue)->m_device->m_pacer->forceReflexPacingBypass(
+                telemetry::FailureReason::BridgeCaptureException, context);
     }
     return result;
 }
@@ -157,8 +162,13 @@ void pacer_command_queue_retire_capture(
         COMMAND_QUEUE(command_queue)->retireCaptureLease(token,
                 CaptureRetireReason::BenignAbort);
     } catch (...) {
-        COMMAND_QUEUE(command_queue)->m_device->m_pacer->m_simulationLedger
-                .forcePacingBypass();
+        FirstFailureContext context;
+        context.simulationId = token.simulationId;
+        context.captureGeneration = token.captureGeneration;
+        context.externalReflexId = token.externalReflexId;
+        context.contextId = token.publicationLeaseId;
+        COMMAND_QUEUE(command_queue)->m_device->m_pacer->forceReflexPacingBypass(
+                telemetry::FailureReason::BridgeCaptureException, context);
     }
 }
 
@@ -244,7 +254,8 @@ void NvAPI_setLatencyMarker( pacer_device_handle handle, uint64_t frameId, VkLat
     try {
         DEVICE(handle)->m_nvApi_pacingAdapter->setLatencyMarker(frameId, marker);
     } catch (...) {
-        DEVICE(handle)->m_pacer->m_simulationLedger.forcePacingBypass();
+        DEVICE(handle)->m_pacer->forceReflexPacingBypass(
+                telemetry::FailureReason::BridgeMarkerException);
     }
 }
 
@@ -296,7 +307,23 @@ uint64_t pacer_notify_present( pacer_device_handle device, void* vkd3d_swapchain
     }
 
     if (!attempt || attempt.threadId != dxvk::this_thread::get_id()) {
-        DEVICE(device)->m_pacer->forceReflexPacingBypass();
+        FirstFailureContext context;
+        const uint32_t callerThreadId = dxvk::this_thread::get_id();
+        context.simulationId = attempt.simulationId;
+        context.contextId = attempt.attemptGeneration;
+        context.contextValue0 = attempt.accountingEpoch;
+        context.contextValue1 = presentation_sequence;
+        context.contextValue2 = DEVICE(device)->getSwapchainTelemetryId(vkd3d_swapchain);
+        context.contextCount0 = attempt.threadId;
+        context.contextCount1 = callerThreadId;
+        if (attempt)
+            context.flags |= telemetry::FirstFailurePresentTokenProvided;
+        if (attempt.threadId == callerThreadId)
+            context.flags |= telemetry::FirstFailureCallerTokenThreadMatch;
+        DEVICE(device)->m_pacer->forceReflexPacingBypass(!attempt
+                ? telemetry::FailureReason::InvalidPresentAttemptZeroToken
+                : telemetry::FailureReason::InvalidPresentAttemptThreadMismatch,
+                context);
         DEVICE(device)->m_pacer->m_waitableDxgiSwapchain.releaseSemaphore(
                 vkd3d_swapchain, 1);
     } else if (FramePacer::isReflexAccountingState(attempt.accountingEpoch)) {
@@ -360,8 +387,22 @@ void pacer_notify_aborted_present( pacer_device_handle device,
     assert(vkd3d_swapchain);
 
     PresentAttemptToken attempt = import_present_attempt(rawAttempt);
-    if (!attempt || attempt.threadId != dxvk::this_thread::get_id())
-        DEVICE(device)->m_pacer->forceReflexPacingBypass();
+    if (!attempt || attempt.threadId != dxvk::this_thread::get_id()) {
+        FirstFailureContext context;
+        const uint32_t callerThreadId = dxvk::this_thread::get_id();
+        context.simulationId = attempt.simulationId;
+        context.contextId = attempt.attemptGeneration;
+        context.contextValue0 = attempt.accountingEpoch;
+        context.contextValue2 = DEVICE(device)->getSwapchainTelemetryId(vkd3d_swapchain);
+        context.contextCount0 = attempt.threadId;
+        context.contextCount1 = callerThreadId;
+        if (attempt)
+            context.flags |= telemetry::FirstFailurePresentTokenProvided;
+        if (attempt.threadId == callerThreadId)
+            context.flags |= telemetry::FirstFailureCallerTokenThreadMatch;
+        DEVICE(device)->m_pacer->forceReflexPacingBypass(
+                telemetry::FailureReason::InvalidAbortedPresentToken, context);
+    }
     else if (FramePacer::isReflexAccountingState(attempt.accountingEpoch))
         DEVICE(device)->m_pacer->cancelReflexPresent(attempt);
 

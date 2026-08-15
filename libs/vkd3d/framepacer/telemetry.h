@@ -14,7 +14,7 @@
 
 namespace pacer::telemetry {
 
-static constexpr uint32_t SchemaVersion = 2;
+static constexpr uint32_t SchemaVersion = 3;
 static constexpr uint32_t DefaultRingCapacity = 4096;
 
 enum class InitializationFailure : uint8_t {
@@ -35,16 +35,44 @@ enum class ExplicitFinalizeResult : uint8_t {
     FailedIncomplete,
 };
 
-enum class Type : uint16_t { Pacing, Submit, Present, GpuFrontier, Prediction };
+enum class Type : uint16_t { Pacing, Submit, Present, GpuFrontier, Prediction, FirstFailure };
 enum class Phase : uint16_t { Complete, Wait, Decision, Sleep, DxgiEntry, VkPresent };
 enum class QueueRole : uint8_t { Normal, OobRender, OobPresent, Unknown };
 enum class CaptureClass : uint8_t { RenderCaptured, Uncaptured, Ambiguous };
+/* Stable producer-side codes. The writer owns their textual representation. */
+enum class FailureReason : uint16_t {
+    None,
+    InvalidRenderStart,
+    InvalidRenderEnd,
+    CaptureAcquireFailure,
+    CaptureLeaseIdentityFailure,
+    SubmitOrCaptureSealFailure,
+    PresentStartFailure,
+    PresentCancelFailure,
+    PresentRecordFailure,
+    VulkanPublicationFailure,
+    CompletionFailure,
+    AbandonedCapturedSubmit,
+    BridgeCaptureException,
+    BridgeMarkerException,
+    InvalidPresentAttemptZeroToken,
+    InvalidPresentAttemptThreadMismatch,
+    InvalidAbortedPresentToken,
+    ExplicitForceOrOther,
+};
+
+enum FirstFailureFlags : uint32_t {
+    FirstFailureReflexAccountingActive = 1u << 0,
+    FirstFailurePresentTokenProvided = 1u << 1,
+    FirstFailureCallerTokenThreadMatch = 1u << 2,
+};
 
 /* One deliberately plain, fixed-size producer record. Unused fields remain zero.
  * The writer interprets fields by type/phase; producers never format JSON. */
 struct Event {
     Type type = Type::Pacing;
     Phase phase = Phase::Complete;
+    FailureReason failureReason = FailureReason::None;
     uint32_t flags = 0;
     uint64_t sequence = 0;
     uint64_t cpuTimestampNs = 0;

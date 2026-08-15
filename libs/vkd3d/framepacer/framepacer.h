@@ -305,7 +305,9 @@ namespace pacer {
         bool notifyReflexPresent(const PresentAttemptToken& attemptToken,
                 void* swapchain, uint64_t sequence);
         void cancelReflexPresent(const PresentAttemptToken& attemptToken);
-        void forceReflexPacingBypass();
+        void forceReflexPacingBypass(telemetry::FailureReason reason =
+                telemetry::FailureReason::ExplicitForceOrOther,
+                const FirstFailureContext& context = {});
         SubmitCompletionResult accountReflexCompletion(SubmitRecord& submit, void* commandQueue,
                 uint64_t commandGeneration, void* vulkanQueue,
                 uint64_t vulkanGeneration, uint64_t gpuTimestamp,

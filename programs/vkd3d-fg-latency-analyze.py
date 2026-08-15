@@ -9,8 +9,19 @@ import statistics
 import sys
 
 
-SUPPORTED_SCHEMAS = {2}
-EVENT_TYPES = {"PACING", "SUBMIT", "PRESENT", "GPU_FRONTIER", "PREDICTION"}
+SUPPORTED_SCHEMAS = {2, 3}
+EVENT_TYPES = {"PACING", "SUBMIT", "PRESENT", "GPU_FRONTIER", "PREDICTION",
+               "FIRST_FAILURE"}
+FIRST_FAILURE_REASONS = {
+    "INVALID_RENDER_START", "INVALID_RENDER_END", "CAPTURE_ACQUIRE_FAILURE",
+    "CAPTURE_LEASE_IDENTITY_FAILURE", "SUBMIT_OR_CAPTURE_SEAL_FAILURE",
+    "PRESENT_START_FAILURE", "PRESENT_CANCEL_FAILURE", "PRESENT_RECORD_FAILURE",
+    "VULKAN_PUBLICATION_FAILURE", "COMPLETION_FAILURE", "ABANDONED_CAPTURED_SUBMIT",
+    "BRIDGE_CAPTURE_EXCEPTION", "BRIDGE_MARKER_EXCEPTION",
+    "INVALID_PRESENT_ATTEMPT_ZERO_TOKEN",
+    "INVALID_PRESENT_ATTEMPT_THREAD_MISMATCH", "INVALID_ABORTED_PRESENT_TOKEN",
+    "EXPLICIT_FORCE_OR_OTHER",
+}
 
 
 def is_integer(value):
@@ -89,8 +100,17 @@ def validate(records):
     }
     frontier_fields = {"gpu_completion_host_ns": int, "publication_cpu_ns": int,
                        "published_submit_count": int, "completed_submit_count": int}
+    first_failure_fields = {
+        "failure_reason": str, "cpu_finished_watermark": int,
+        "gpu_finished_watermark": int, "context_id": int,
+        "context_value0": int, "context_value1": int, "context_value2": int,
+        "context_count0": int, "context_count1": int,
+        "reflex_accounting_active": bool, "present_token_provided": bool,
+        "caller_token_thread_match": bool,
+    }
 
     expected_sequence = 1
+    first_failures = set()
     for line, record in enumerate(records[1:-1], 2):
         record_type = record.get("record_type")
         if record_type not in EVENT_TYPES:
@@ -115,6 +135,19 @@ def validate(records):
             if (record["published_submit_count"] <= 0 or
                     record["published_submit_count"] != record["completed_submit_count"]):
                 raise ValueError(f"line {line}: GPU_FRONTIER submit counts are not truthful")
+        elif record_type == "FIRST_FAILURE":
+            if schema < 3:
+                raise ValueError(f"line {line}: FIRST_FAILURE requires schema_version 3")
+            require(record, line, first_failure_fields)
+            if record["failure_reason"] not in FIRST_FAILURE_REASONS:
+                raise ValueError(f"line {line}: unsupported FIRST_FAILURE reason "
+                                 f"{record['failure_reason']!r}")
+            if not record["reflex_accounting_active"]:
+                raise ValueError(f"line {line}: FIRST_FAILURE was not emitted for active Reflex accounting")
+            key = (record["device_id"], record["epoch_id"])
+            if key in first_failures:
+                raise ValueError(f"line {line}: duplicate FIRST_FAILURE for active epoch")
+            first_failures.add(key)
 
     event_count = len(records) - 2
     if summary["published_records"] != event_count:
@@ -178,6 +211,18 @@ def analyze(records, summary):
 
     dropped = summary["dropped_records"]
     print(f"dropped records: {dropped}" + (" (capture incomplete)" if dropped else ""))
+
+    first_failures = [r for r in records if r.get("record_type") == "FIRST_FAILURE"]
+    if first_failures:
+        for failure in first_failures:
+            print("FIRST_FAILURE: "
+                  f"device={failure['device_id']} epoch={failure['epoch_id']} "
+                  f"reason={failure['failure_reason']} simulation={failure['simulation_id']} "
+                  f"capture={failure['capture_generation']} "
+                  f"cpuFinished={failure['cpu_finished_watermark']} "
+                  f"gpuFinished={failure['gpu_finished_watermark']}")
+    else:
+        print("FIRST_FAILURE: none")
 
     waits = [r for r in records if r.get("record_type") == "PACING" and r["phase"] == "WAIT"]
     decisions = [r for r in records if r.get("record_type") == "PACING" and r["phase"] == "DECISION"]
