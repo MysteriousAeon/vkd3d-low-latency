@@ -22,6 +22,11 @@ FIRST_FAILURE_REASONS = {
     "INVALID_PRESENT_ATTEMPT_THREAD_MISMATCH", "INVALID_ABORTED_PRESENT_TOKEN",
     "EXPLICIT_FORCE_OR_OTHER",
 }
+INVALID_RENDER_START_SUBREASONS = {
+    "ZERO_EXTERNAL_ID", "NON_MONOTONIC_OR_DUPLICATE", "MAPPING_ABSENT",
+    "MAPPING_TARGET_MISSING", "MAPPED_WRONG_EPOCH",
+    "MAPPED_SUBMISSIONS_SEALED", "MAPPED_TRACKING_FAILED",
+}
 
 
 def is_integer(value):
@@ -142,6 +147,17 @@ def validate(records):
             if record["failure_reason"] not in FIRST_FAILURE_REASONS:
                 raise ValueError(f"line {line}: unsupported FIRST_FAILURE reason "
                                  f"{record['failure_reason']!r}")
+            if "invalid_render_start_subreason" in record:
+                if record["failure_reason"] != "INVALID_RENDER_START":
+                    raise ValueError(f"line {line}: invalid_render_start_subreason requires "
+                                     "INVALID_RENDER_START")
+                subreason = record["invalid_render_start_subreason"]
+                if not isinstance(subreason, str):
+                    raise ValueError(f"line {line}: field invalid_render_start_subreason "
+                                     "must be str")
+                if subreason not in INVALID_RENDER_START_SUBREASONS:
+                    raise ValueError(f"line {line}: unsupported INVALID_RENDER_START subreason "
+                                     f"{subreason!r}")
             if not record["reflex_accounting_active"]:
                 raise ValueError(f"line {line}: FIRST_FAILURE was not emitted for active Reflex accounting")
             key = (record["device_id"], record["epoch_id"])
@@ -220,7 +236,9 @@ def analyze(records, summary):
                   f"reason={failure['failure_reason']} simulation={failure['simulation_id']} "
                   f"capture={failure['capture_generation']} "
                   f"cpuFinished={failure['cpu_finished_watermark']} "
-                  f"gpuFinished={failure['gpu_finished_watermark']}")
+                  f"gpuFinished={failure['gpu_finished_watermark']}"
+                  + (f" subreason={failure['invalid_render_start_subreason']}"
+                     if 'invalid_render_start_subreason' in failure else ""))
     else:
         print("FIRST_FAILURE: none")
 

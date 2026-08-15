@@ -1787,6 +1787,51 @@ static unsigned count_text(const std::string& text, const char *needle)
     return count;
 }
 
+static std::string first_failure_for_epoch(const std::string& text, uint64_t epoch)
+{
+    const std::string epoch_text = "\"epoch_id\":" + std::to_string(epoch);
+    size_t position = 0;
+    while ((position = text.find("\"record_type\":\"FIRST_FAILURE\"", position)) !=
+            std::string::npos)
+    {
+        size_t end = text.find('\n', position);
+        std::string line = text.substr(position, end - position);
+        if (line.find(epoch_text) != std::string::npos)
+            return line;
+        position = end == std::string::npos ? text.size() : end + 1;
+    }
+    return {};
+}
+
+static void run_invalid_render_start_subreason_unit_case()
+{
+    pacer::SimulationRecord simulation = {};
+    simulation.accountingEpoch = 7;
+
+    check(pacer::classifyInvalidRenderStart(false, nullptr, 7) ==
+                    pacer::telemetry::InvalidRenderStartSubreason::MappingAbsent,
+            "invalid-render-start-subreason: absent mapping classified incorrectly.\n");
+    check(pacer::classifyInvalidRenderStart(true, nullptr, 7) ==
+                    pacer::telemetry::InvalidRenderStartSubreason::MappingTargetMissing,
+            "invalid-render-start-subreason: missing mapping target classified incorrectly.\n");
+    check(pacer::classifyInvalidRenderStart(true, &simulation, 8) ==
+                    pacer::telemetry::InvalidRenderStartSubreason::MappedWrongEpoch,
+            "invalid-render-start-subreason: wrong epoch classified incorrectly.\n");
+    simulation.submissionsSealed = true;
+    check(pacer::classifyInvalidRenderStart(true, &simulation, 7) ==
+                    pacer::telemetry::InvalidRenderStartSubreason::MappedSubmissionsSealed,
+            "invalid-render-start-subreason: sealed submissions classified incorrectly.\n");
+    simulation.submissionsSealed = false;
+    simulation.trackingFailed = true;
+    check(pacer::classifyInvalidRenderStart(true, &simulation, 7) ==
+                    pacer::telemetry::InvalidRenderStartSubreason::MappedTrackingFailed,
+            "invalid-render-start-subreason: tracking failure classified incorrectly.\n");
+    check(pacer::classifyInvalidRenderStart(true, &simulation, 7) ==
+                    pacer::telemetry::InvalidRenderStartSubreason::MappedTrackingFailed,
+            "invalid-render-start-subreason: tracking failure classification was unstable.\n");
+    std::printf("invalid-render-start-subreason: all mapped-state classifications stayed exact.\n");
+}
+
 static void run_first_failure_telemetry_case()
 {
 #ifdef _WIN32
@@ -1860,6 +1905,43 @@ static void run_first_failure_telemetry_case()
     check(ledger.shouldBypassPacing(),
             "first-failure: ledger-owned invalid START did not preserve bypass.\n");
 
+    ledger.activateEpoch(51, 2);
+    ledger.openRenderCapture(51, 1, 1, 0);
+    check(ledger.shouldBypassPacing(),
+            "first-failure: absent mapping invalid START did not preserve bypass.\n");
+    /* The later duplicate must not replace the earlier MAPPING_ABSENT winner. */
+    ledger.beginSimulation(51, 1, 1, pacer::SimulationLedger::time_point{});
+    ledger.openRenderCapture(51, 1, 1, 0);
+    ledger.openRenderCapture(51, 1, 1, 0);
+
+    ledger.activateEpoch(53, 2);
+    ledger.beginSimulation(53, 1, 1, pacer::SimulationLedger::time_point{});
+    ledger.openRenderCapture(53, 1, 1, 0);
+    ledger.openRenderCapture(53, 1, 1, 0);
+    check(ledger.shouldBypassPacing(),
+            "first-failure: duplicate invalid START did not preserve bypass.\n");
+
+    /* A healthy capture A must not claim the diagnostic when the distinct
+     * zero-ID render-start rejection B invalidates the frontier. */
+    ledger.activateEpoch(55, 2);
+    ledger.beginSimulation(55, 1, 1, pacer::SimulationLedger::time_point{});
+    ledger.openRenderCapture(55, 1, 1, 0);
+    ledger.openRenderCapture(55, 0, 1, 0);
+    check(ledger.shouldBypassPacing(),
+            "first-failure: zero-ID rejection after open capture did not bypass pacing.\n");
+
+    /* Conversely, an earlier distinct winner A remains immutable after B. */
+    ledger.activateEpoch(57, 2);
+    pacer::FirstFailureContext winner_a = {};
+    winner_a.simulationId = 701;
+    winner_a.captureGeneration = 702;
+    winner_a.externalReflexId = 703;
+    winner_a.contextId = 704;
+    check(ledger.forcePacingBypass(pacer::telemetry::FailureReason::CompletionFailure,
+                    winner_a),
+            "first-failure: distinct initial winner did not claim the latch.\n");
+    ledger.openRenderCapture(57, 0, 1, 0);
+
     {
         fixture f(true, true);
         pacer_present_attempt_token zero = {};
@@ -1882,8 +1964,8 @@ static void run_first_failure_telemetry_case()
                 concurrent_failure = line;
         }
     }
-    check(count_text(first_failures, "\"record_type\":\"FIRST_FAILURE\"") == 5,
-            "first-failure: expected exactly five first-failure records, got %u.\n",
+    check(count_text(first_failures, "\"record_type\":\"FIRST_FAILURE\"") == 9,
+            "first-failure: expected exactly nine first-failure records, got %u.\n",
             count_text(first_failures, "\"record_type\":\"FIRST_FAILURE\""));
     check(count_text(first_failures, "\"epoch_id\":41") == 1 &&
             first_failures.find("\"epoch_id\":41") != std::string::npos &&
@@ -1900,10 +1982,47 @@ static void run_first_failure_telemetry_case()
             concurrent_failure.find("\"failure_reason\":\"COMPLETION_FAILURE\"") !=
                     std::string::npos),
             "first-failure: concurrent telemetry reason was not owned by the CAS winner.\n");
-    check(first_failures.find("\"epoch_id\":49") != std::string::npos &&
-            first_failures.find("\"failure_reason\":\"INVALID_RENDER_START\"") !=
+    std::string zero_external_id_failure = first_failure_for_epoch(first_failures, 49);
+    std::string mapping_absent_failure = first_failure_for_epoch(first_failures, 51);
+    std::string duplicate_failure = first_failure_for_epoch(first_failures, 53);
+    std::string open_capture_zero_id_failure = first_failure_for_epoch(first_failures, 55);
+    std::string preserved_winner_failure = first_failure_for_epoch(first_failures, 57);
+    check(zero_external_id_failure.find("\"failure_reason\":\"INVALID_RENDER_START\"") !=
+                    std::string::npos &&
+            zero_external_id_failure.find("\"invalid_render_start_subreason\":\"ZERO_EXTERNAL_ID\"") !=
                     std::string::npos,
-            "first-failure: ledger-owned tracking failure lacked its distinct reason.\n");
+            "first-failure: zero external ID lacked its exact invalid START subreason.\n");
+    check(mapping_absent_failure.find("\"failure_reason\":\"INVALID_RENDER_START\"") !=
+                    std::string::npos &&
+            mapping_absent_failure.find("\"invalid_render_start_subreason\":\"MAPPING_ABSENT\"") !=
+                    std::string::npos,
+            "first-failure: MAPPING_ABSENT did not retain the CAS-winning subreason.\n");
+    check(duplicate_failure.find("\"failure_reason\":\"INVALID_RENDER_START\"") !=
+                    std::string::npos &&
+            duplicate_failure.find("\"invalid_render_start_subreason\":\"NON_MONOTONIC_OR_DUPLICATE\"") !=
+                    std::string::npos,
+            "first-failure: duplicate START lacked its exact invalid START subreason.\n");
+    check(open_capture_zero_id_failure.find("\"failure_reason\":\"INVALID_RENDER_START\"") !=
+                    std::string::npos &&
+            open_capture_zero_id_failure.find("\"invalid_render_start_subreason\":\"ZERO_EXTERNAL_ID\"") !=
+                    std::string::npos &&
+            open_capture_zero_id_failure.find("\"external_reflex_id\":0") !=
+                    std::string::npos &&
+            open_capture_zero_id_failure.find("\"simulation_id\":0") !=
+                    std::string::npos &&
+            open_capture_zero_id_failure.find("\"capture_generation\":0") !=
+                    std::string::npos &&
+            open_capture_zero_id_failure.find("\"context_id\":0") !=
+                    std::string::npos,
+            "first-failure: zero-ID rejection inherited identity from the open capture.\n");
+    check(preserved_winner_failure.find("\"failure_reason\":\"COMPLETION_FAILURE\"") !=
+                    std::string::npos &&
+            preserved_winner_failure.find("\"simulation_id\":701") != std::string::npos &&
+            preserved_winner_failure.find("\"capture_generation\":702") != std::string::npos &&
+            preserved_winner_failure.find("\"external_reflex_id\":703") != std::string::npos &&
+            preserved_winner_failure.find("\"context_id\":704") != std::string::npos &&
+            preserved_winner_failure.find("invalid_render_start_subreason") == std::string::npos,
+            "first-failure: later distinct invalid START overwrote the earlier winner.\n");
     check(first_failures.find("\"failure_reason\":\"INVALID_PRESENT_ATTEMPT_ZERO_TOKEN\"") !=
                     std::string::npos &&
             first_failures.find("\"reflex_accounting_active\":true") !=
@@ -1914,7 +2033,7 @@ static void run_first_failure_telemetry_case()
                     std::string::npos,
             "first-failure: zero Present token was not diagnosed with active Reflex context.\n");
     pacer::telemetry::testReset();
-    std::printf("first-failure: one-shot, concurrent, epoch, zero-token, and ledger failure telemetry validated.\n");
+    std::printf("first-failure: one-shot, concurrent, epoch, zero-token, and distinct invalid START identity telemetry validated.\n");
 }
 
 static fixture::submit_pair submit_telemetry_captured(fixture& f,
@@ -2922,6 +3041,7 @@ int main()
     run_command_ring_iterator_case();
     run_telemetry_completion_identity_case();
     run_telemetry_completion_metadata_lifetime_case();
+    run_invalid_render_start_subreason_unit_case();
     run_first_failure_telemetry_case();
 
     if (failures)

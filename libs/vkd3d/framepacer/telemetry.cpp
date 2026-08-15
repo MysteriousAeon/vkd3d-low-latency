@@ -379,6 +379,21 @@ static const char *failureReasonName(FailureReason reason) {
     return "EXPLICIT_FORCE_OR_OTHER";
 }
 
+static const char *invalidRenderStartSubreasonName(
+        InvalidRenderStartSubreason subreason) {
+    switch (subreason) {
+        case InvalidRenderStartSubreason::None: return "NONE";
+        case InvalidRenderStartSubreason::ZeroExternalId: return "ZERO_EXTERNAL_ID";
+        case InvalidRenderStartSubreason::NonMonotonicOrDuplicate: return "NON_MONOTONIC_OR_DUPLICATE";
+        case InvalidRenderStartSubreason::MappingAbsent: return "MAPPING_ABSENT";
+        case InvalidRenderStartSubreason::MappingTargetMissing: return "MAPPING_TARGET_MISSING";
+        case InvalidRenderStartSubreason::MappedWrongEpoch: return "MAPPED_WRONG_EPOCH";
+        case InvalidRenderStartSubreason::MappedSubmissionsSealed: return "MAPPED_SUBMISSIONS_SEALED";
+        case InvalidRenderStartSubreason::MappedTrackingFailed: return "MAPPED_TRACKING_FAILED";
+    }
+    return "NONE";
+}
+
 static const char *phaseName(Phase phase) {
     switch (phase) {
         case Phase::Complete: return "COMPLETE";
@@ -472,6 +487,12 @@ void Session::writeEvent(const Event& e, std::string& out) {
                 (e.flags & FirstFailurePresentTokenProvided) ? "true" : "false",
                 (e.flags & FirstFailureCallerTokenThreadMatch) ? "true" : "false");
         out += line;
+        if (e.failureReason == FailureReason::InvalidRenderStart &&
+                e.invalidRenderStartSubreason != InvalidRenderStartSubreason::None) {
+            std::snprintf(line, sizeof(line), ",\"invalid_render_start_subreason\":\"%s\"",
+                    invalidRenderStartSubreasonName(e.invalidRenderStartSubreason));
+            out += line;
+        }
     } else if (e.type == Type::Pacing && e.phase == Phase::Wait) {
         std::snprintf(line, sizeof(line),
                 ",\"latency_sleep_entry_ns\":%" PRIu64 ",\"wait_id\":%" PRIu64

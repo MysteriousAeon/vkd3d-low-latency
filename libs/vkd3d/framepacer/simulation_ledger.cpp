@@ -132,6 +132,7 @@ namespace pacer {
             telemetry::Event event;
             event.type = telemetry::Type::FirstFailure;
             event.failureReason = reason;
+            event.invalidRenderStartSubreason = context.invalidRenderStartSubreason;
             event.deviceId = m_telemetryDeviceId;
             event.epochId = m_activeEpoch;
             event.simulationId = context.simulationId;
@@ -153,17 +154,23 @@ namespace pacer {
     }
 
     void SimulationLedger::markTrackingFailureLocked(SimulationRecord* simulation,
-            telemetry::FailureReason reason, const FirstFailureContext& context) {
+            telemetry::FailureReason reason, const FirstFailureContext& context,
+            bool exactContext) {
         if (simulation)
             simulation->trackingFailed = true;
         FirstFailureContext resolved = context;
-        if (!resolved.simulationId && simulation)
+        if (!exactContext && !resolved.simulationId && simulation)
             resolved = contextForSimulation(simulation);
         claimPacingBypassLocked(reason, resolved);
     }
 
     void SimulationLedger::failCaptureLocked(CaptureRecord& capture,
             CaptureFailureReason reason) {
+        failCaptureLocked(capture, reason, contextForCapture(&capture));
+    }
+
+    void SimulationLedger::failCaptureLocked(CaptureRecord& capture,
+            CaptureFailureReason reason, const FirstFailureContext& context) {
         if (capture.state == CaptureState::Retired)
             return;
         capture.state = CaptureState::Failed;
@@ -172,8 +179,7 @@ namespace pacer {
         capture.submissionSealRequested = true;
         m_openCaptures.erase(capture.captureGeneration);
         SimulationRecord* simulation = findSimulationLocked(capture.simulationId);
-        markTrackingFailureLocked(simulation, firstFailureReason(reason),
-                contextForCapture(&capture));
+        markTrackingFailureLocked(simulation, firstFailureReason(reason), context, true);
         if (simulation)
             finalizeSubmissionSealLocked(*simulation, &capture);
     }
@@ -189,7 +195,7 @@ namespace pacer {
             uint64_t generation = *m_openCaptures.begin();
             CaptureRecord* capture = findCaptureLocked(generation);
             if (capture)
-                failCaptureLocked(*capture, reason);
+                failCaptureLocked(*capture, reason, context);
             else
                 m_openCaptures.erase(generation);
         }
@@ -230,6 +236,8 @@ namespace pacer {
         context.externalReflexId = externalReflexId;
         context.contextId = externalReflexId;
         if (!externalReflexId) {
+            context.invalidRenderStartSubreason =
+                    telemetry::InvalidRenderStartSubreason::ZeroExternalId;
             markUntrustedFrontierLocked(CaptureFailureReason::InvalidStart, context);
             return;
         }
@@ -239,14 +247,18 @@ namespace pacer {
          * permanent replay guard; heavyweight associations are only needed
          * while exact capture ownership can still be affected. */
         if (externalReflexId <= m_highestStartedExternalId) {
+            context.invalidRenderStartSubreason =
+                    telemetry::InvalidRenderStartSubreason::NonMonotonicOrDuplicate;
             markUntrustedFrontierLocked(CaptureFailureReason::DuplicateStart, context);
             return;
         }
         auto mapping = m_externalMappings.find(externalReflexId);
         SimulationRecord* simulation = mapping != m_externalMappings.end()
                 ? findSimulationLocked(mapping->second) : nullptr;
-        if (!simulation || simulation->accountingEpoch != accountingEpoch ||
-                simulation->submissionsSealed || simulation->trackingFailed) {
+        context.invalidRenderStartSubreason = classifyInvalidRenderStart(
+                mapping != m_externalMappings.end(), simulation, accountingEpoch);
+        if (context.invalidRenderStartSubreason !=
+                telemetry::InvalidRenderStartSubreason::None) {
             markUntrustedFrontierLocked(CaptureFailureReason::InvalidStart, context);
             return;
         }

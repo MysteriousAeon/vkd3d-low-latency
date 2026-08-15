@@ -156,6 +156,25 @@ namespace pacer {
         std::vector<PresentationRecord> presentations;
     };
 
+    /* Keep the render-START rejection classification independent from the
+     * persistent-bypass path which consumes it. This also gives the
+     * source-invariant-impossible states a narrow deterministic unit surface. */
+    inline telemetry::InvalidRenderStartSubreason classifyInvalidRenderStart(
+            bool mappingPresent, const SimulationRecord* simulation,
+            uint64_t accountingEpoch) {
+        if (!mappingPresent)
+            return telemetry::InvalidRenderStartSubreason::MappingAbsent;
+        if (!simulation)
+            return telemetry::InvalidRenderStartSubreason::MappingTargetMissing;
+        if (simulation->accountingEpoch != accountingEpoch)
+            return telemetry::InvalidRenderStartSubreason::MappedWrongEpoch;
+        if (simulation->submissionsSealed)
+            return telemetry::InvalidRenderStartSubreason::MappedSubmissionsSealed;
+        if (simulation->trackingFailed)
+            return telemetry::InvalidRenderStartSubreason::MappedTrackingFailed;
+        return telemetry::InvalidRenderStartSubreason::None;
+    }
+
     struct ThreadPresentOwnership {
         uint32_t threadId = 0;
         uint64_t accountingEpoch = 0;
@@ -201,6 +220,8 @@ namespace pacer {
         uint32_t contextCount0 = 0;
         uint32_t contextCount1 = 0;
         uint32_t flags = 0;
+        telemetry::InvalidRenderStartSubreason invalidRenderStartSubreason =
+                telemetry::InvalidRenderStartSubreason::None;
     };
 
 #ifdef VKD3D_ENABLE_TEST_HOOKS
@@ -320,10 +341,12 @@ namespace pacer {
         void markTrackingFailureLocked(SimulationRecord* simulation,
                 telemetry::FailureReason reason =
                         telemetry::FailureReason::ExplicitForceOrOther,
-                const FirstFailureContext& context = {});
+                const FirstFailureContext& context = {}, bool exactContext = false);
         void markUntrustedFrontierLocked(CaptureFailureReason reason,
                 const FirstFailureContext& context = {});
         void failCaptureLocked(CaptureRecord& capture, CaptureFailureReason reason);
+        void failCaptureLocked(CaptureRecord& capture, CaptureFailureReason reason,
+                const FirstFailureContext& context);
         void cancelPresentLocked(ThreadPresentOwnership& ownership);
         void requestSubmissionSealLocked(SimulationRecord& simulation,
                 CaptureRecord* capture);

@@ -61,6 +61,19 @@ enum class FailureReason : uint16_t {
     ExplicitForceOrOther,
 };
 
+/* Stable producer-side codes for the reason-scoped FIRST_FAILURE extension.
+ * None means no INVALID_RENDER_START subreason was captured. */
+enum class InvalidRenderStartSubreason : uint8_t {
+    None,
+    ZeroExternalId,
+    NonMonotonicOrDuplicate,
+    MappingAbsent,
+    MappingTargetMissing,
+    MappedWrongEpoch,
+    MappedSubmissionsSealed,
+    MappedTrackingFailed,
+};
+
 enum FirstFailureFlags : uint32_t {
     FirstFailureReflexAccountingActive = 1u << 0,
     FirstFailurePresentTokenProvided = 1u << 1,
@@ -73,6 +86,8 @@ struct Event {
     Type type = Type::Pacing;
     Phase phase = Phase::Complete;
     FailureReason failureReason = FailureReason::None;
+    InvalidRenderStartSubreason invalidRenderStartSubreason =
+            InvalidRenderStartSubreason::None;
     uint32_t flags = 0;
     uint64_t sequence = 0;
     uint64_t cpuTimestampNs = 0;

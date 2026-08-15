@@ -119,6 +119,68 @@ class AnalyzerValidationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("FIRST_FAILURE: device=1 epoch=1 "
                       "reason=INVALID_PRESENT_ATTEMPT_ZERO_TOKEN", result.stdout)
+        self.assertNotIn("subreason=", result.stdout)
+
+    def test_invalid_render_start_subreason_is_accepted_and_reported(self):
+        failure = first_failure(1, failure_reason="INVALID_RENDER_START",
+                                invalid_render_start_subreason="MAPPING_ABSENT")
+        result = run_capture([run_record(3), failure, summary(1, schema=3)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("reason=INVALID_RENDER_START", result.stdout)
+        self.assertIn("subreason=MAPPING_ABSENT", result.stdout)
+
+    def test_all_known_invalid_render_start_subreasons_are_accepted(self):
+        for subreason in (
+                "ZERO_EXTERNAL_ID", "NON_MONOTONIC_OR_DUPLICATE",
+                "MAPPING_ABSENT", "MAPPING_TARGET_MISSING",
+                "MAPPED_WRONG_EPOCH", "MAPPED_SUBMISSIONS_SEALED",
+                "MAPPED_TRACKING_FAILED"):
+            failure = first_failure(1, failure_reason="INVALID_RENDER_START",
+                                    invalid_render_start_subreason=subreason)
+            result = run_capture([run_record(3), failure, summary(1, schema=3)])
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_capture_006_style_v3_first_failure_without_subreason_remains_accepted(self):
+        failure = first_failure(1, failure_reason="INVALID_RENDER_START")
+        result = run_capture([run_record(3), failure, summary(1, schema=3)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("subreason=", result.stdout)
+
+    def test_invalid_render_start_subreason_rejects_explicit_null(self):
+        failure = first_failure(1, failure_reason="INVALID_RENDER_START",
+                                invalid_render_start_subreason=None)
+        result = run_capture([run_record(3), failure, summary(1, schema=3)])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must be str", result.stderr)
+
+    def test_invalid_render_start_subreason_rejects_non_string_types(self):
+        for subreason in (1, True, [], {}):
+            with self.subTest(subreason=subreason):
+                failure = first_failure(1, failure_reason="INVALID_RENDER_START",
+                                        invalid_render_start_subreason=subreason)
+                result = run_capture([run_record(3), failure, summary(1, schema=3)])
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("must be str", result.stderr)
+
+    def test_unknown_invalid_render_start_subreason_is_rejected(self):
+        failure = first_failure(1, failure_reason="INVALID_RENDER_START",
+                                invalid_render_start_subreason="SPECULATIVE")
+        result = run_capture([run_record(3), failure, summary(1, schema=3)])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unsupported INVALID_RENDER_START subreason", result.stderr)
+
+    def test_invalid_render_start_subreason_requires_matching_reason(self):
+        failure = first_failure(1,
+                                invalid_render_start_subreason="MAPPING_ABSENT")
+        result = run_capture([run_record(3), failure, summary(1, schema=3)])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires INVALID_RENDER_START", result.stderr)
+
+    def test_null_subreason_requires_matching_reason(self):
+        failure = first_failure(1, invalid_render_start_subreason=None)
+        result = run_capture([run_record(3), failure, summary(1, schema=3)])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires INVALID_RENDER_START", result.stderr)
 
     def test_first_failure_requires_reason(self):
         failure = first_failure(1)
