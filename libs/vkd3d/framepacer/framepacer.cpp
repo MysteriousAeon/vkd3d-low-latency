@@ -135,25 +135,55 @@ namespace pacer {
     }
 
     uint64_t FramePacer::beginReflexSimulation(uint64_t accountingEpoch,
-            uint64_t externalReflexId, uint32_t threadId, time_point start) {
+            uint64_t externalReflexId, uint32_t threadId, time_point start,
+            telemetry::MarkerObservation *markerObservation,
+            telemetry::MarkerDisposition *markerDisposition) {
         std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        if (markerObservation)
+            markerObservation->serializationSequence =
+                    telemetry::allocateMarkerSerializationSequence();
         uint64_t simulationId = m_simulationLedger.beginSimulation(
                 accountingEpoch, externalReflexId, threadId, start);
-        if (!simulationId)
+        if (!simulationId) {
+            if (markerDisposition) {
+                if (m_accountingState.load(std::memory_order_acquire) != accountingEpoch ||
+                        !isReflexAccountingState(accountingEpoch))
+                    *markerDisposition = telemetry::MarkerDisposition::RejectedStale;
+                else
+                    *markerDisposition = externalReflexId
+                            ? telemetry::MarkerDisposition::RejectedStale
+                            : telemetry::MarkerDisposition::ZeroExternalId;
+            }
             return 0;
+        }
         m_latencyMarkers.updateMarkers(accountingEpoch, simulationId,
                 [&](LatencyMarkers& markers) {
             if (markers.start == time_point{})
                 markers.start = start;
         });
+        if (markerDisposition)
+            *markerDisposition = telemetry::MarkerDisposition::AcceptedMapping;
         return simulationId;
     }
 
     void FramePacer::beginReflexRenderSubmit(uint64_t accountingEpoch,
-            uint64_t externalReflexId, uint32_t threadId, int32_t renderStart) {
+            uint64_t externalReflexId, uint32_t threadId, int32_t renderStart,
+            telemetry::MarkerObservation *markerObservation,
+            telemetry::MarkerDisposition *markerDisposition) {
         std::lock_guard<dxvk::mutex> lock(m_progressMutex);
+        if (markerObservation)
+            markerObservation->serializationSequence =
+                    telemetry::allocateMarkerSerializationSequence();
         m_simulationLedger.openRenderCapture(accountingEpoch,
-                externalReflexId, threadId, renderStart);
+                externalReflexId, threadId, renderStart,
+                markerObservation ? markerObservation->serializationSequence : 0);
+        if (markerDisposition) {
+            *markerDisposition =
+                    m_accountingState.load(std::memory_order_acquire) == accountingEpoch &&
+                    isReflexAccountingState(accountingEpoch)
+                    ? telemetry::MarkerDisposition::ReachedRenderStart
+                    : telemetry::MarkerDisposition::RejectedStale;
+        }
     }
 
     void FramePacer::endReflexRenderSubmit(uint64_t accountingEpoch,

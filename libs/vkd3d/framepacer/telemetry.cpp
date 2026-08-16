@@ -40,6 +40,8 @@ static std::mutex g_producerMutex;
 static std::condition_variable g_producerCond;
 static std::atomic<uint64_t> g_nextSwapchainId = {1};
 static std::atomic<uint64_t> g_nextDeviceId = {1};
+static std::atomic<uint64_t> g_nextMarkerArrivalSequence = {1};
+static std::atomic<uint64_t> g_nextMarkerSerializationSequence = {1};
 static ExplicitFinalizeResult explicitFinalize() noexcept;
 
 #ifdef _WIN32
@@ -351,8 +353,29 @@ static const char *typeName(Type type) {
         case Type::GpuFrontier: return "GPU_FRONTIER";
         case Type::Prediction: return "PREDICTION";
         case Type::FirstFailure: return "FIRST_FAILURE";
+        case Type::Marker: return "MARKER";
     }
     return "UNKNOWN";
+}
+
+static const char *markerKindName(MarkerKind kind) {
+    switch (kind) {
+        case MarkerKind::SimulationStart: return "SIMULATION_START";
+        case MarkerKind::RenderSubmitStart: return "RENDERSUBMIT_START";
+        default: return "UNKNOWN";
+    }
+}
+
+static const char *markerDispositionName(MarkerDisposition disposition) {
+    switch (disposition) {
+        case MarkerDisposition::AcceptedMapping: return "ACCEPTED_MAPPING";
+        case MarkerDisposition::IgnoredInactive: return "IGNORED_INACTIVE";
+        case MarkerDisposition::RejectedStale: return "REJECTED_STALE";
+        case MarkerDisposition::ZeroExternalId: return "ZERO_EXTERNAL_ID";
+        case MarkerDisposition::ReachedRenderStart: return "REACHED_RENDER_START";
+        case MarkerDisposition::Exception: return "EXCEPTION";
+        default: return "UNKNOWN";
+    }
 }
 
 static const char *failureReasonName(FailureReason reason) {
@@ -493,6 +516,23 @@ void Session::writeEvent(const Event& e, std::string& out) {
                     invalidRenderStartSubreasonName(e.invalidRenderStartSubreason));
             out += line;
         }
+        if (e.failureReason == FailureReason::InvalidRenderStart &&
+                e.originatingMarkerSerializationSequence) {
+            std::snprintf(line, sizeof(line),
+                    ",\"originating_marker_serialization_sequence\":%" PRIu64,
+                    e.originatingMarkerSerializationSequence);
+            out += line;
+        }
+    } else if (e.type == Type::Marker) {
+        std::snprintf(line, sizeof(line),
+                ",\"marker_kind\":\"%s\",\"marker_arrival_sequence\":%" PRIu64
+                ",\"observed_accounting_state\":%" PRIu64
+                ",\"observed_reflex_epoch\":%" PRIu64
+                ",\"serialization_sequence\":%" PRIu64
+                ",\"disposition\":\"%s\",\"thread_id\":%u",
+                markerKindName(e.markerKind), e.id0, e.id1, e.id2,
+                e.timestamp0, markerDispositionName(e.markerDisposition), e.threadId);
+        out += line;
     } else if (e.type == Type::Pacing && e.phase == Phase::Wait) {
         std::snprintf(line, sizeof(line),
                 ",\"latency_sleep_entry_ns\":%" PRIu64 ",\"wait_id\":%" PRIu64
@@ -1050,6 +1090,31 @@ uint64_t allocateDeviceId() {
     return g_nextDeviceId.fetch_add(1, std::memory_order_relaxed);
 }
 
+uint64_t allocateMarkerArrivalSequence() {
+    return g_nextMarkerArrivalSequence.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t allocateMarkerSerializationSequence() {
+    return g_nextMarkerSerializationSequence.fetch_add(1, std::memory_order_relaxed);
+}
+
+void emitMarkerEvent(uint64_t deviceId, const MarkerObservation& observation,
+        MarkerDisposition disposition) {
+    Event event;
+    event.type = Type::Marker;
+    event.deviceId = deviceId;
+    event.epochId = observation.observedReflexEpoch;
+    event.externalReflexId = observation.externalReflexId;
+    event.markerKind = observation.kind;
+    event.markerDisposition = disposition;
+    event.id0 = observation.arrivalSequence;
+    event.id1 = observation.observedAccountingState;
+    event.id2 = observation.observedReflexEpoch;
+    event.timestamp0 = observation.serializationSequence;
+    event.threadId = observation.threadId;
+    emit(event);
+}
+
 #ifdef VKD3D_ENABLE_TEST_HOOKS
 bool testInitialize(const std::string& path, uint32_t waitLatency,
         uint32_t capacity, bool deferWriter, InitializationFailure failure,
@@ -1081,6 +1146,8 @@ void testReset() {
     g_lifecycle.store(Lifecycle::NeverInitialized, std::memory_order_release);
     g_producerState.store(ProducerClosed, std::memory_order_release);
     g_ownerCount = 0;
+    g_nextMarkerArrivalSequence.store(1, std::memory_order_release);
+    g_nextMarkerSerializationSequence.store(1, std::memory_order_release);
     g_testInitializerEntries.store(0, std::memory_order_release);
     {
         std::lock_guard<std::mutex> testLock(g_testFinalizationMutex);

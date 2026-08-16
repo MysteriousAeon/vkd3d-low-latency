@@ -7,6 +7,8 @@
 #include <algorithm>
 #ifdef VKD3D_ENABLE_TEST_HOOKS
 #include <stdexcept>
+#include <condition_variable>
+#include <mutex>
 #endif
 
 
@@ -222,12 +224,73 @@ namespace pacer {
             state->last_end_sleep = m_lastEndSleep.load(std::memory_order_acquire)
                     .time_since_epoch().count();
         }
+
+        void testArmSimulationMarkerAfterArrival() {
+            std::lock_guard<std::mutex> lock(m_testMarkerMutex);
+            m_testPauseSimulationMarkerAfterArrival = true;
+            m_testSimulationMarkerPaused = false;
+            m_testResumeSimulationMarker = false;
+        }
+
+        void testWaitSimulationMarkerAfterArrival() {
+            std::unique_lock<std::mutex> lock(m_testMarkerMutex);
+            m_testMarkerCond.wait(lock, [&] { return m_testSimulationMarkerPaused; });
+        }
+
+        void testResumeSimulationMarkerAfterArrival() {
+            std::lock_guard<std::mutex> lock(m_testMarkerMutex);
+            m_testResumeSimulationMarker = true;
+            m_testMarkerCond.notify_all();
+        }
 #endif
 
         void setLatencyMarker( uint64_t nvId, VkLatencyMarkerNV marker ) {
-            uint64_t accountingEpoch = m_device->m_pacer->getReflexEpoch();
-            if (!accountingEpoch)
+            const telemetry::MarkerKind markerKind =
+                    marker == VK_LATENCY_MARKER_SIMULATION_START_NV
+                    ? telemetry::MarkerKind::SimulationStart
+                    : marker == VK_LATENCY_MARKER_RENDERSUBMIT_START_NV
+                    ? telemetry::MarkerKind::RenderSubmitStart
+                    : telemetry::MarkerKind::None;
+            const bool diagnosticEnabled = markerKind != telemetry::MarkerKind::None &&
+                    telemetry::isEnabled();
+            telemetry::MarkerObservation markerObservation = {};
+            uint64_t accountingState = m_device->m_pacer->getAccountingState();
+            uint64_t accountingEpoch = FramePacer::isReflexAccountingState(accountingState)
+                    ? accountingState : 0;
+            if (diagnosticEnabled) {
+                markerObservation.kind = markerKind;
+                markerObservation.externalReflexId = nvId;
+                markerObservation.arrivalSequence = telemetry::allocateMarkerArrivalSequence();
+                markerObservation.observedAccountingState = accountingState;
+                markerObservation.observedReflexEpoch = accountingEpoch;
+                markerObservation.threadId = dxvk::this_thread::get_id();
+            }
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+            if (markerKind == telemetry::MarkerKind::SimulationStart) {
+                std::unique_lock<std::mutex> lock(m_testMarkerMutex);
+                if (m_testPauseSimulationMarkerAfterArrival) {
+                    m_testSimulationMarkerPaused = true;
+                    m_testMarkerCond.notify_all();
+                    m_testMarkerCond.wait(lock, [&] { return m_testResumeSimulationMarker; });
+                    m_testPauseSimulationMarkerAfterArrival = false;
+                    m_testSimulationMarkerPaused = false;
+                    m_testResumeSimulationMarker = false;
+                }
+            }
+#endif
+
+            auto emitMarker = [&](telemetry::MarkerDisposition disposition) {
+                if (diagnosticEnabled)
+                    telemetry::emitMarkerEvent(m_device->m_telemetryId,
+                            markerObservation, disposition);
+            };
+
+            try {
+            if (!accountingEpoch) {
+                if (markerKind != telemetry::MarkerKind::None)
+                    emitMarker(telemetry::MarkerDisposition::IgnoredInactive);
                 return;
+            }
 
             using namespace std::chrono;
             switch (marker) {
@@ -256,12 +319,19 @@ namespace pacer {
                             m_pendingSleep.store(false, std::memory_order_release);
                         }
                         t = m_lastEndSleep.load(std::memory_order_acquire);
-                    }))
+                    })) {
+                        emitMarker(telemetry::MarkerDisposition::RejectedStale);
                         break;
+                    }
 
-                    uint32_t threadId = dxvk::this_thread::get_id();
+                    uint32_t threadId = diagnosticEnabled ? markerObservation.threadId
+                            : dxvk::this_thread::get_id();
+                    telemetry::MarkerDisposition disposition =
+                            telemetry::MarkerDisposition::None;
                     uint64_t pacerId = m_device->m_pacer->beginReflexSimulation(
-                            accountingEpoch, nvId, threadId, t);
+                            accountingEpoch, nvId, threadId, t,
+                            diagnosticEnabled ? &markerObservation : nullptr,
+                            diagnosticEnabled ? &disposition : nullptr);
                     if (pacerId)
                         pacerId = m_mapping.pushMapping(nvId, pacerId,
                                 accountingEpoch, t);
@@ -274,6 +344,7 @@ namespace pacer {
                             m_pendingSleep.store(false,
                                     std::memory_order_release);
                         });
+                    emitMarker(disposition);
                     break;
                 }
 
@@ -287,9 +358,14 @@ namespace pacer {
                     m_mapping.updateRenderStart(nvId, accountingEpoch, now);
                     FramePacer::FrameInfo frameInfo = m_mapping.getFrameInfo(
                             nvId, accountingEpoch);
+                    telemetry::MarkerDisposition disposition =
+                            telemetry::MarkerDisposition::None;
                     m_device->m_pacer->beginReflexRenderSubmit(accountingEpoch,
-                            nvId, dxvk::this_thread::get_id(),
-                            frameInfo.renderStart);
+                            nvId, diagnosticEnabled ? markerObservation.threadId
+                                    : dxvk::this_thread::get_id(), frameInfo.renderStart,
+                            diagnosticEnabled ? &markerObservation : nullptr,
+                            diagnosticEnabled ? &disposition : nullptr);
+                    emitMarker(disposition);
                     break;
                 }
 
@@ -330,6 +406,11 @@ namespace pacer {
                     _INFO( "unhandled VK_LATENCY_MARKER %" PRIu32 " for nv-id %" PRIu64 "\n", marker, nvId );
                     break;
             }
+            } catch (...) {
+                if (diagnosticEnabled)
+                    emitMarker(telemetry::MarkerDisposition::Exception);
+                throw;
+            }
         }
 
     private:
@@ -353,6 +434,11 @@ namespace pacer {
 #ifdef VKD3D_ENABLE_TEST_HOOKS
         std::atomic<bool> m_testPauseAfterSleep = { false };
         std::atomic<bool> m_testSleepReturned = { false };
+        std::mutex m_testMarkerMutex;
+        std::condition_variable m_testMarkerCond;
+        bool m_testPauseSimulationMarkerAfterArrival = false;
+        bool m_testSimulationMarkerPaused = false;
+        bool m_testResumeSimulationMarker = false;
 #endif
 
     };

@@ -459,6 +459,21 @@ bool pacer_test_sleep_returned(void *device) {
     return DEVICE(device)->m_nvApi_pacingAdapter->testSleepReturned();
 }
 
+void pacer_test_arm_simulation_marker_after_arrival(void *device) {
+    assert(device);
+    DEVICE(device)->m_nvApi_pacingAdapter->testArmSimulationMarkerAfterArrival();
+}
+
+void pacer_test_wait_simulation_marker_after_arrival(void *device) {
+    assert(device);
+    DEVICE(device)->m_nvApi_pacingAdapter->testWaitSimulationMarkerAfterArrival();
+}
+
+void pacer_test_resume_simulation_marker_after_arrival(void *device) {
+    assert(device);
+    DEVICE(device)->m_nvApi_pacingAdapter->testResumeSimulationMarkerAfterArrival();
+}
+
 void pacer_test_get_nvapi_adapter_state(void *device,
         vkd3d_test_nvapi_adapter_state *state) {
     assert(device);

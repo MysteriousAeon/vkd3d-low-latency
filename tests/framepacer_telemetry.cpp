@@ -210,6 +210,41 @@ static void testEnabledSchema() {
         check(!line.empty() && line.front() == '{' && line.back() == '}', "JSONL framing corrupt");
 }
 
+static void testMarkerDiagnosticSequences() {
+    testReset();
+    constexpr unsigned Producers = 4;
+    constexpr unsigned PerProducer = 1000;
+    std::vector<uint64_t> arrivals;
+    std::vector<uint64_t> serializations;
+    std::mutex mutex;
+    std::vector<std::thread> threads;
+    for (unsigned producer = 0; producer < Producers; producer++) {
+        threads.emplace_back([&] {
+            std::vector<uint64_t> localArrivals;
+            std::vector<uint64_t> localSerializations;
+            for (unsigned i = 0; i < PerProducer; i++) {
+                localArrivals.push_back(allocateMarkerArrivalSequence());
+                localSerializations.push_back(allocateMarkerSerializationSequence());
+            }
+            std::lock_guard<std::mutex> lock(mutex);
+            arrivals.insert(arrivals.end(), localArrivals.begin(), localArrivals.end());
+            serializations.insert(serializations.end(), localSerializations.begin(),
+                    localSerializations.end());
+        });
+    }
+    for (auto& thread : threads)
+        thread.join();
+    std::sort(arrivals.begin(), arrivals.end());
+    std::sort(serializations.begin(), serializations.end());
+    for (unsigned i = 0; i < Producers * PerProducer; i++) {
+        check(arrivals[i] == i + 1,
+                "marker arrival sequence was not unique and contiguous");
+        check(serializations[i] == i + 1,
+                "marker serialization sequence was not unique and contiguous");
+    }
+    testReset();
+}
+
 static void testOverflow() {
     std::string path = tempPath("vkd3d-telemetry-overflow.jsonl");
     std::remove(path.c_str());
@@ -1502,6 +1537,7 @@ int main(int argc, char **argv) {
 #endif
     testDisabled();
     testEnabledSchema();
+    testMarkerDiagnosticSequences();
     testOverflow();
     testMultiProducer();
     testSmallRingManyTurns();

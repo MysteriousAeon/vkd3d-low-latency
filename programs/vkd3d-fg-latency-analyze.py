@@ -9,9 +9,9 @@ import statistics
 import sys
 
 
-SUPPORTED_SCHEMAS = {2, 3}
+SUPPORTED_SCHEMAS = {2, 3, 4}
 EVENT_TYPES = {"PACING", "SUBMIT", "PRESENT", "GPU_FRONTIER", "PREDICTION",
-               "FIRST_FAILURE"}
+               "FIRST_FAILURE", "MARKER"}
 FIRST_FAILURE_REASONS = {
     "INVALID_RENDER_START", "INVALID_RENDER_END", "CAPTURE_ACQUIRE_FAILURE",
     "CAPTURE_LEASE_IDENTITY_FAILURE", "SUBMIT_OR_CAPTURE_SEAL_FAILURE",
@@ -26,6 +26,13 @@ INVALID_RENDER_START_SUBREASONS = {
     "ZERO_EXTERNAL_ID", "NON_MONOTONIC_OR_DUPLICATE", "MAPPING_ABSENT",
     "MAPPING_TARGET_MISSING", "MAPPED_WRONG_EPOCH",
     "MAPPED_SUBMISSIONS_SEALED", "MAPPED_TRACKING_FAILED",
+}
+MARKER_KINDS = {"SIMULATION_START", "RENDERSUBMIT_START"}
+MARKER_DISPOSITIONS = {
+    "SIMULATION_START": {"ACCEPTED_MAPPING", "IGNORED_INACTIVE",
+                           "REJECTED_STALE", "ZERO_EXTERNAL_ID", "EXCEPTION"},
+    "RENDERSUBMIT_START": {"REACHED_RENDER_START", "IGNORED_INACTIVE",
+                             "REJECTED_STALE", "EXCEPTION"},
 }
 
 
@@ -113,9 +120,15 @@ def validate(records):
         "reflex_accounting_active": bool, "present_token_provided": bool,
         "caller_token_thread_match": bool,
     }
+    marker_fields = {
+        "marker_kind": str, "marker_arrival_sequence": int,
+        "observed_accounting_state": int, "observed_reflex_epoch": int,
+        "serialization_sequence": int, "disposition": str, "thread_id": int,
+    }
 
     expected_sequence = 1
     first_failures = set()
+    marker_serializations = set()
     for line, record in enumerate(records[1:-1], 2):
         record_type = record.get("record_type")
         if record_type not in EVENT_TYPES:
@@ -158,12 +171,47 @@ def validate(records):
                 if subreason not in INVALID_RENDER_START_SUBREASONS:
                     raise ValueError(f"line {line}: unsupported INVALID_RENDER_START subreason "
                                      f"{subreason!r}")
+            if "originating_marker_serialization_sequence" in record:
+                if schema < 4:
+                    raise ValueError(f"line {line}: originating marker identity requires "
+                                     "schema_version 4")
+                if record["failure_reason"] != "INVALID_RENDER_START":
+                    raise ValueError(f"line {line}: originating marker identity requires "
+                                     "INVALID_RENDER_START")
+                causal_sequence = record["originating_marker_serialization_sequence"]
+                if not is_integer(causal_sequence) or causal_sequence <= 0:
+                    raise ValueError(f"line {line}: originating marker identity must be "
+                                     "a positive int")
             if not record["reflex_accounting_active"]:
                 raise ValueError(f"line {line}: FIRST_FAILURE was not emitted for active Reflex accounting")
             key = (record["device_id"], record["epoch_id"])
             if key in first_failures:
                 raise ValueError(f"line {line}: duplicate FIRST_FAILURE for active epoch")
             first_failures.add(key)
+        elif record_type == "MARKER":
+            if schema < 4:
+                raise ValueError(f"line {line}: MARKER requires schema_version 4")
+            require(record, line, marker_fields)
+            kind = record["marker_kind"]
+            disposition = record["disposition"]
+            if kind not in MARKER_KINDS:
+                raise ValueError(f"line {line}: unsupported marker_kind {kind!r}")
+            if disposition not in MARKER_DISPOSITIONS[kind]:
+                raise ValueError(f"line {line}: unsupported {kind} disposition {disposition!r}")
+            if record["marker_arrival_sequence"] <= 0:
+                raise ValueError(f"line {line}: marker_arrival_sequence must be positive")
+            if record["thread_id"] < 0:
+                raise ValueError(f"line {line}: thread_id must be non-negative")
+            if disposition in {"ACCEPTED_MAPPING", "REACHED_RENDER_START"} and \
+                    record["serialization_sequence"] <= 0:
+                raise ValueError(f"line {line}: serialized marker lacks serialization_sequence")
+            if disposition == "IGNORED_INACTIVE" and record["serialization_sequence"] != 0:
+                raise ValueError(f"line {line}: inactive marker reached serialization")
+            serialization_sequence = record["serialization_sequence"]
+            if serialization_sequence > 0:
+                if serialization_sequence in marker_serializations:
+                    raise ValueError(f"line {line}: duplicate marker serialization_sequence")
+                marker_serializations.add(serialization_sequence)
 
     event_count = len(records) - 2
     if summary["published_records"] != event_count:
@@ -219,6 +267,51 @@ def compare_envelopes(left, right):
     return "INDETERMINATE"
 
 
+def marker_order_classification(records, summary, failure):
+    """Classify only direct diagnostic evidence; missing records remain unknown."""
+    if summary["dropped_records"]:
+        return "ORDERING_NOT_DISTINGUISHABLE (marker evidence incomplete: dropped_records > 0)"
+    causal_sequence = failure.get("originating_marker_serialization_sequence")
+    if causal_sequence is None:
+        return "ORDERING_NOT_DISTINGUISHABLE (causal render identity unavailable)"
+    markers = [r for r in records if r.get("record_type") == "MARKER" and
+               r["device_id"] == failure["device_id"]]
+    if not markers:
+        return "ORDERING_NOT_DISTINGUISHABLE (marker-arrival evidence unavailable)"
+    matching = [r for r in markers if r["external_reflex_id"] ==
+                failure["external_reflex_id"] and
+                r["observed_reflex_epoch"] == failure["epoch_id"]]
+    renders = [r for r in matching if r["marker_kind"] == "RENDERSUBMIT_START" and
+               r["disposition"] == "REACHED_RENDER_START" and
+               r["serialization_sequence"] == causal_sequence]
+    if len(renders) != 1:
+        return "ORDERING_NOT_DISTINGUISHABLE (exact causal render marker unavailable)"
+    render = renders[0]
+    simulations = [r for r in matching if r["marker_kind"] == "SIMULATION_START" and
+                   r["disposition"] == "ACCEPTED_MAPPING"]
+    if len(simulations) > 1:
+        return "ORDERING_NOT_DISTINGUISHABLE (multiple same-epoch simulation markers)"
+    if simulations:
+        simulation = simulations[0]
+        if simulation["marker_arrival_sequence"] > render["marker_arrival_sequence"]:
+            return "SIMULATION_START_LATE_AFTER_RENDER"
+        if simulation["serialization_sequence"] > render["serialization_sequence"]:
+            return "SIMULATION_START_ARRIVED_FIRST_BUT_SERIALIZED_AFTER_RENDER"
+        return "ORDERING_NOT_DISTINGUISHABLE"
+    inactive = [r for r in markers if r["marker_kind"] == "SIMULATION_START" and
+                r["external_reflex_id"] == failure["external_reflex_id"] and
+                r["disposition"] == "IGNORED_INACTIVE"]
+    if inactive:
+        return "SIMULATION_START_IGNORED_INACTIVE"
+    different = [r for r in markers if r["marker_kind"] == "SIMULATION_START" and
+                 r["external_reflex_id"] != failure["external_reflex_id"] and
+                 r["observed_reflex_epoch"] == failure["epoch_id"] and
+                 r["disposition"] == "ACCEPTED_MAPPING"]
+    if different:
+        return "SIMULATION_START_DIFFERENT_EXTERNAL_ID"
+    return "SIMULATION_START_NOT_SEEN_BEFORE_FAILURE"
+
+
 def analyze(records, summary):
     counts = collections.Counter(r["record_type"] for r in records)
     print("record counts:")
@@ -241,6 +334,12 @@ def analyze(records, summary):
                      if 'invalid_render_start_subreason' in failure else ""))
     else:
         print("FIRST_FAILURE: none")
+
+    for failure in first_failures:
+        if (failure["failure_reason"] == "INVALID_RENDER_START" and
+                failure.get("invalid_render_start_subreason") == "MAPPING_ABSENT"):
+            print("MARKER_ORDER_DIAGNOSTIC: " +
+                  marker_order_classification(records, summary, failure))
 
     waits = [r for r in records if r.get("record_type") == "PACING" and r["phase"] == "WAIT"]
     decisions = [r for r in records if r.get("record_type") == "PACING" and r["phase"] == "DECISION"]

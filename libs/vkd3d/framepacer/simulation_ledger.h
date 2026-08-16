@@ -222,6 +222,9 @@ namespace pacer {
         uint32_t flags = 0;
         telemetry::InvalidRenderStartSubreason invalidRenderStartSubreason =
                 telemetry::InvalidRenderStartSubreason::None;
+        /* Diagnostic-only identity of the exact RENDERSUBMIT_START invocation
+         * that entered openRenderCapture(). Zero means unavailable. */
+        uint64_t originatingMarkerSerializationSequence = 0;
     };
 
 #ifdef VKD3D_ENABLE_TEST_HOOKS
@@ -262,7 +265,8 @@ namespace pacer {
                 time_point start);
         void openRenderCapture(uint64_t accountingEpoch,
                 uint64_t externalReflexId, uint32_t threadId,
-                int32_t renderStart);
+                int32_t renderStart,
+                uint64_t originatingMarkerSerializationSequence = 0);
         SimulationProgress closeRenderCapture(uint64_t accountingEpoch,
                 uint64_t externalReflexId, uint32_t threadId,
                 int32_t renderEnd);

@@ -14,7 +14,7 @@
 
 namespace pacer::telemetry {
 
-static constexpr uint32_t SchemaVersion = 3;
+static constexpr uint32_t SchemaVersion = 4;
 static constexpr uint32_t DefaultRingCapacity = 4096;
 
 enum class InitializationFailure : uint8_t {
@@ -35,10 +35,33 @@ enum class ExplicitFinalizeResult : uint8_t {
     FailedIncomplete,
 };
 
-enum class Type : uint16_t { Pacing, Submit, Present, GpuFrontier, Prediction, FirstFailure };
+enum class Type : uint16_t { Pacing, Submit, Present, GpuFrontier, Prediction, FirstFailure, Marker };
 enum class Phase : uint16_t { Complete, Wait, Decision, Sleep, DxgiEntry, VkPresent };
 enum class QueueRole : uint8_t { Normal, OobRender, OobPresent, Unknown };
 enum class CaptureClass : uint8_t { RenderCaptured, Uncaptured, Ambiguous };
+/* Stable diagnostic-only marker codes. */
+enum class MarkerKind : uint8_t { None, SimulationStart, RenderSubmitStart };
+enum class MarkerDisposition : uint8_t {
+    None,
+    AcceptedMapping,
+    IgnoredInactive,
+    RejectedStale,
+    ZeroExternalId,
+    ReachedRenderStart,
+    Exception,
+};
+
+/* This is captured at the common adapter entry point. The serialization
+ * sequence remains zero when the marker cannot reach FramePacer. */
+struct MarkerObservation {
+    MarkerKind kind = MarkerKind::None;
+    uint64_t externalReflexId = 0;
+    uint64_t arrivalSequence = 0;
+    uint64_t observedAccountingState = 0;
+    uint64_t observedReflexEpoch = 0;
+    uint32_t threadId = 0;
+    uint64_t serializationSequence = 0;
+};
 /* Stable producer-side codes. The writer owns their textual representation. */
 enum class FailureReason : uint16_t {
     None,
@@ -88,6 +111,8 @@ struct Event {
     FailureReason failureReason = FailureReason::None;
     InvalidRenderStartSubreason invalidRenderStartSubreason =
             InvalidRenderStartSubreason::None;
+    MarkerKind markerKind = MarkerKind::None;
+    MarkerDisposition markerDisposition = MarkerDisposition::None;
     uint32_t flags = 0;
     uint64_t sequence = 0;
     uint64_t cpuTimestampNs = 0;
@@ -110,6 +135,8 @@ struct Event {
     int64_t value3 = 0;
     uint32_t count0 = 0;
     uint32_t count1 = 0;
+    uint32_t threadId = 0;
+    uint64_t originatingMarkerSerializationSequence = 0;
     QueueRole queueRole = QueueRole::Unknown;
     CaptureClass captureClass = CaptureClass::Ambiguous;
     uint8_t reserved[6] = {};
@@ -231,6 +258,10 @@ bool isEnabled();
 bool emit(Event event);
 uint64_t allocateSwapchainId();
 uint64_t allocateDeviceId();
+uint64_t allocateMarkerArrivalSequence();
+uint64_t allocateMarkerSerializationSequence();
+void emitMarkerEvent(uint64_t deviceId, const MarkerObservation& observation,
+        MarkerDisposition disposition);
 
 #ifdef VKD3D_ENABLE_TEST_HOOKS
 enum class TestFinalizationAuthority : uint8_t {

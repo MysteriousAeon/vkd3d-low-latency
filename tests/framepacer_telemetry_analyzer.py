@@ -81,6 +81,18 @@ def first_failure(sequence, **values):
     return result
 
 
+def marker(sequence, kind, arrival, serialization, disposition, **values):
+    result = event("MARKER", sequence, schema_version=4, epoch_id=5,
+                   external_reflex_id=1, phase="COMPLETE",
+                   queue_role="UNKNOWN", capture_class="AMBIGUOUS",
+                   marker_kind=kind, marker_arrival_sequence=arrival,
+                   observed_accounting_state=5, observed_reflex_epoch=5,
+                   serialization_sequence=serialization,
+                   disposition=disposition, thread_id=17)
+    result.update(values)
+    return result
+
+
 class AnalyzerValidationTests(unittest.TestCase):
     def test_unsupported_schema(self):
         result = run_capture([run_record(1), summary(0, schema=1)])
@@ -145,6 +157,144 @@ class AnalyzerValidationTests(unittest.TestCase):
         result = run_capture([run_record(3), failure, summary(1, schema=3)])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("subreason=", result.stdout)
+
+    def test_capture_007_style_v3_without_markers_refuses_marker_order_claim(self):
+        failure = first_failure(1, epoch_id=5, external_reflex_id=1,
+                                failure_reason="INVALID_RENDER_START",
+                                invalid_render_start_subreason="MAPPING_ABSENT")
+        result = run_capture([run_record(3), failure, summary(1, schema=3)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ORDERING_NOT_DISTINGUISHABLE (causal render identity unavailable)",
+                      result.stdout)
+
+    def test_marker_diagnostic_binds_causal_render_despite_publication_inversion(self):
+        failure = first_failure(1, schema_version=4, epoch_id=5, external_reflex_id=1,
+                                failure_reason="INVALID_RENDER_START",
+                                invalid_render_start_subreason="MAPPING_ABSENT",
+                                originating_marker_serialization_sequence=20)
+        # R2 is published before causal R1. Selecting by event_sequence would
+        # call this an arrival-first/serialization-second inversion; R1 proves late.
+        later_render = marker(2, "RENDERSUBMIT_START", 13, 21, "REACHED_RENDER_START")
+        causal_render = marker(3, "RENDERSUBMIT_START", 11, 20, "REACHED_RENDER_START")
+        simulation = marker(4, "SIMULATION_START", 12, 22, "ACCEPTED_MAPPING")
+        result = run_capture([run_record(4), failure, later_render, causal_render,
+                              simulation, summary(4, schema=4)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SIMULATION_START_LATE_AFTER_RENDER", result.stdout)
+        self.assertNotIn("SIMULATION_START_ARRIVED_FIRST_BUT_SERIALIZED_AFTER_RENDER",
+                         result.stdout)
+
+    def test_marker_diagnostic_reports_arrival_first_serialization_second(self):
+        failure = first_failure(1, schema_version=4, epoch_id=5, external_reflex_id=1,
+                                failure_reason="INVALID_RENDER_START",
+                                invalid_render_start_subreason="MAPPING_ABSENT",
+                                originating_marker_serialization_sequence=20)
+        render = marker(2, "RENDERSUBMIT_START", 11, 20, "REACHED_RENDER_START")
+        simulation = marker(3, "SIMULATION_START", 10, 21, "ACCEPTED_MAPPING")
+        result = run_capture([run_record(4), failure, render, simulation, summary(3, schema=4)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SIMULATION_START_ARRIVED_FIRST_BUT_SERIALIZED_AFTER_RENDER",
+                      result.stdout)
+
+    def test_marker_diagnostic_refuses_epoch_reuse(self):
+        failure = first_failure(1, schema_version=4, epoch_id=5, external_reflex_id=1,
+                                failure_reason="INVALID_RENDER_START",
+                                invalid_render_start_subreason="MAPPING_ABSENT",
+                                originating_marker_serialization_sequence=20)
+        render = marker(2, "RENDERSUBMIT_START", 11, 20, "REACHED_RENDER_START")
+        simulation = marker(3, "SIMULATION_START", 10, 19, "ACCEPTED_MAPPING",
+                            observed_accounting_state=7, observed_reflex_epoch=7)
+        result = run_capture([run_record(4), failure, render, simulation, summary(3, schema=4)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SIMULATION_START_NOT_SEEN_BEFORE_FAILURE", result.stdout)
+
+    def test_marker_diagnostic_refuses_other_device(self):
+        failure = first_failure(1, schema_version=4, epoch_id=5, external_reflex_id=1,
+                                failure_reason="INVALID_RENDER_START",
+                                invalid_render_start_subreason="MAPPING_ABSENT",
+                                originating_marker_serialization_sequence=20)
+        render = marker(2, "RENDERSUBMIT_START", 11, 20, "REACHED_RENDER_START")
+        simulation = marker(3, "SIMULATION_START", 10, 19, "ACCEPTED_MAPPING",
+                            device_id=2)
+        result = run_capture([run_record(4), failure, render, simulation, summary(3, schema=4)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SIMULATION_START_NOT_SEEN_BEFORE_FAILURE", result.stdout)
+
+    def test_marker_diagnostic_reports_inactive_without_epoch_claim(self):
+        failure = first_failure(1, schema_version=4, epoch_id=5, external_reflex_id=1,
+                                failure_reason="INVALID_RENDER_START",
+                                invalid_render_start_subreason="MAPPING_ABSENT",
+                                originating_marker_serialization_sequence=20)
+        render = marker(2, "RENDERSUBMIT_START", 11, 20, "REACHED_RENDER_START")
+        simulation = marker(3, "SIMULATION_START", 10, 0, "IGNORED_INACTIVE",
+                            observed_accounting_state=2, observed_reflex_epoch=0)
+        result = run_capture([run_record(4), failure, render, simulation, summary(3, schema=4)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SIMULATION_START_IGNORED_INACTIVE", result.stdout)
+        self.assertNotIn("PRE_ACTIVATION", result.stdout)
+
+    def test_marker_diagnostic_reports_different_external_id(self):
+        failure = first_failure(1, schema_version=4, epoch_id=5, external_reflex_id=1,
+                                failure_reason="INVALID_RENDER_START",
+                                invalid_render_start_subreason="MAPPING_ABSENT",
+                                originating_marker_serialization_sequence=20)
+        render = marker(2, "RENDERSUBMIT_START", 11, 20, "REACHED_RENDER_START")
+        simulation = marker(3, "SIMULATION_START", 10, 19, "ACCEPTED_MAPPING",
+                            external_reflex_id=2)
+        result = run_capture([run_record(4), failure, render, simulation, summary(3, schema=4)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SIMULATION_START_DIFFERENT_EXTERNAL_ID", result.stdout)
+
+    def test_marker_diagnostic_reports_not_seen_only_without_drops(self):
+        failure = first_failure(1, schema_version=4, epoch_id=5, external_reflex_id=1,
+                                failure_reason="INVALID_RENDER_START",
+                                invalid_render_start_subreason="MAPPING_ABSENT",
+                                originating_marker_serialization_sequence=20)
+        render = marker(2, "RENDERSUBMIT_START", 11, 20, "REACHED_RENDER_START")
+        complete = run_capture([run_record(4), failure, render, summary(2, schema=4)])
+        self.assertEqual(complete.returncode, 0, complete.stderr)
+        self.assertIn("SIMULATION_START_NOT_SEEN_BEFORE_FAILURE", complete.stdout)
+        dropped = run_capture([run_record(4), failure, render, summary(2, dropped=1, schema=4)])
+        self.assertEqual(dropped.returncode, 0, dropped.stderr)
+        self.assertIn("ORDERING_NOT_DISTINGUISHABLE (marker evidence incomplete", dropped.stdout)
+
+    def test_marker_diagnostic_same_epoch_simulation_before_render_is_conservative(self):
+        failure = first_failure(1, schema_version=4, epoch_id=5, external_reflex_id=1,
+                                failure_reason="INVALID_RENDER_START",
+                                invalid_render_start_subreason="MAPPING_ABSENT",
+                                originating_marker_serialization_sequence=20)
+        render = marker(2, "RENDERSUBMIT_START", 11, 20, "REACHED_RENDER_START")
+        simulation = marker(3, "SIMULATION_START", 10, 19, "ACCEPTED_MAPPING")
+        result = run_capture([run_record(4), failure, render, simulation, summary(3, schema=4)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ORDERING_NOT_DISTINGUISHABLE", result.stdout)
+
+    def test_schema4_without_causal_identity_is_conservative(self):
+        failure = first_failure(1, schema_version=4, epoch_id=5, external_reflex_id=1,
+                                failure_reason="INVALID_RENDER_START",
+                                invalid_render_start_subreason="MAPPING_ABSENT")
+        render = marker(2, "RENDERSUBMIT_START", 11, 20, "REACHED_RENDER_START")
+        result = run_capture([run_record(4), failure, render, summary(2, schema=4)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ORDERING_NOT_DISTINGUISHABLE (causal render identity unavailable)",
+                      result.stdout)
+
+    def test_originating_marker_identity_requires_invalid_render_start(self):
+        failure = first_failure(1, schema_version=4,
+                                originating_marker_serialization_sequence=20)
+        result = run_capture([run_record(4), failure, summary(1, schema=4)])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires INVALID_RENDER_START", result.stderr)
+
+    def test_originating_marker_identity_rejects_malformed_value(self):
+        for causal_sequence in (0, -1, True, "20"):
+            with self.subTest(causal_sequence=causal_sequence):
+                failure = first_failure(1, schema_version=4,
+                                        failure_reason="INVALID_RENDER_START",
+                                        originating_marker_serialization_sequence=causal_sequence)
+                result = run_capture([run_record(4), failure, summary(1, schema=4)])
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("must be a positive int", result.stderr)
 
     def test_invalid_render_start_subreason_rejects_explicit_null(self):
         failure = first_failure(1, failure_reason="INVALID_RENDER_START",

@@ -289,10 +289,14 @@ namespace pacer {
         }
 
         uint64_t beginReflexSimulation(uint64_t accountingEpoch,
-                uint64_t externalReflexId, uint32_t threadId, time_point start);
+                uint64_t externalReflexId, uint32_t threadId, time_point start,
+                telemetry::MarkerObservation *markerObservation = nullptr,
+                telemetry::MarkerDisposition *markerDisposition = nullptr);
         void beginReflexRenderSubmit(uint64_t accountingEpoch,
                 uint64_t externalReflexId, uint32_t threadId,
-                int32_t renderStart);
+                int32_t renderStart,
+                telemetry::MarkerObservation *markerObservation = nullptr,
+                telemetry::MarkerDisposition *markerDisposition = nullptr);
         void endReflexRenderSubmit(uint64_t accountingEpoch,
                 uint64_t externalReflexId, uint32_t threadId,
                 int32_t renderEnd);

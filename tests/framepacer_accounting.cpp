@@ -1803,6 +1803,95 @@ static std::string first_failure_for_epoch(const std::string& text, uint64_t epo
     return {};
 }
 
+static std::string marker_line(const std::string& text, uint64_t external_id,
+        const char *kind, const char *disposition)
+{
+    const std::string id = "\"external_reflex_id\":" + std::to_string(external_id);
+    const std::string kind_text = std::string("\"marker_kind\":\"") + kind + "\"";
+    const std::string disposition_text = std::string("\"disposition\":\"") + disposition + "\"";
+    size_t position = 0;
+    while ((position = text.find("\"record_type\":\"MARKER\"", position)) !=
+            std::string::npos)
+    {
+        size_t end = text.find('\n', position);
+        std::string line = text.substr(position, end - position);
+        if (line.find(id) != std::string::npos &&
+                line.find(kind_text) != std::string::npos &&
+                line.find(disposition_text) != std::string::npos)
+            return line;
+        position = end == std::string::npos ? text.size() : end + 1;
+    }
+    return {};
+}
+
+static void run_marker_order_diagnostic_telemetry_case()
+{
+#ifdef _WIN32
+    const char *path = "Z:\\tmp\\vkd3d-marker-order-diagnostic.jsonl";
+#else
+    const char *path = "/tmp/vkd3d-marker-order-diagnostic.jsonl";
+#endif
+    std::remove(path);
+    check(pacer::telemetry::testInitialize(path, 3, 64),
+            "marker-order: failed to initialize telemetry session.\n");
+    std::string output_path = pacer::telemetry::testOutputPath();
+    {
+        fixture f(false, false);
+
+        /* Pre-activation must be recorded without a serialization sequence. */
+        NvAPI_setLatencyMarker(f.device, 71, VK_LATENCY_MARKER_SIMULATION_START_NV);
+
+        NvAPI_setSleepMode(f.device, true, 0);
+        NvAPI_sleep(f.device);
+        NvAPI_setLatencyMarker(f.device, 72, VK_LATENCY_MARKER_SIMULATION_START_NV);
+        NvAPI_setLatencyMarker(f.device, 72, VK_LATENCY_MARKER_RENDERSUBMIT_START_NV);
+
+        /* Force the documented caller-order/serialization split without changing
+         * production synchronization: simulation arrives first, then releases the
+         * adapter point while render serializes first. */
+        NvAPI_sleep(f.device);
+        pacer_test_arm_simulation_marker_after_arrival(f.device);
+        std::thread simulation([&] {
+            NvAPI_setLatencyMarker(f.device, 73, VK_LATENCY_MARKER_SIMULATION_START_NV);
+        });
+        pacer_test_wait_simulation_marker_after_arrival(f.device);
+        NvAPI_setLatencyMarker(f.device, 73, VK_LATENCY_MARKER_RENDERSUBMIT_START_NV);
+        pacer_test_resume_simulation_marker_after_arrival(f.device);
+        simulation.join();
+    }
+    pacer::telemetry::shutdown();
+
+    std::ifstream stream(output_path);
+    std::string text((std::istreambuf_iterator<char>(stream)),
+            std::istreambuf_iterator<char>());
+    std::string inactive = marker_line(text, 71, "SIMULATION_START", "IGNORED_INACTIVE");
+    std::string normal_simulation = marker_line(text, 72, "SIMULATION_START", "ACCEPTED_MAPPING");
+    std::string normal_render = marker_line(text, 72, "RENDERSUBMIT_START", "REACHED_RENDER_START");
+    std::string raced_simulation = marker_line(text, 73, "SIMULATION_START", "ACCEPTED_MAPPING");
+    std::string raced_render = marker_line(text, 73, "RENDERSUBMIT_START", "REACHED_RENDER_START");
+    std::string raced_failure = first_failure_for_epoch(text, 5);
+    check(inactive.find("\"observed_reflex_epoch\":0") != std::string::npos &&
+            inactive.find("\"serialization_sequence\":0") != std::string::npos,
+            "marker-order: inactive simulation was not recorded without serialization.\n");
+    check(normal_simulation.find("\"serialization_sequence\":") != std::string::npos &&
+            normal_render.find("\"serialization_sequence\":") != std::string::npos,
+            "marker-order: normal simulation/render marker telemetry was incomplete.\n");
+    check(raced_simulation.find("\"marker_arrival_sequence\":4") != std::string::npos &&
+            raced_simulation.find("\"serialization_sequence\":4") != std::string::npos &&
+            raced_render.find("\"marker_arrival_sequence\":5") != std::string::npos &&
+            raced_render.find("\"serialization_sequence\":3") != std::string::npos,
+            "marker-order: arrival-first simulation did not serialize after render.\n");
+    check(raced_failure.find("\"failure_reason\":\"INVALID_RENDER_START\"") !=
+            std::string::npos &&
+            raced_failure.find("\"originating_marker_serialization_sequence\":3") !=
+            std::string::npos,
+            "marker-order: first failure did not retain its causal render marker identity.\n");
+    check(text.find("\"schema_version\":4") != std::string::npos,
+            "marker-order: diagnostic capture did not use schema 4.\n");
+    pacer::telemetry::testReset();
+    std::printf("marker-order: inactive, normal, and arrival-first/serialization-second telemetry validated.\n");
+}
+
 static void run_invalid_render_start_subreason_unit_case()
 {
     pacer::SimulationRecord simulation = {};
@@ -1874,11 +1963,13 @@ static void run_first_failure_telemetry_case()
     std::atomic<unsigned> concurrent_winners = { 0 };
     std::atomic<bool> render_won = { false };
     std::atomic<bool> completion_won = { false };
+    pacer::FirstFailureContext render_context = single;
+    render_context.originatingMarkerSerializationSequence = 501;
     std::thread render_failure([&]() {
         while (!concurrent_start.load(std::memory_order_acquire))
             std::this_thread::yield();
         bool won = ledger.forcePacingBypass(
-                pacer::telemetry::FailureReason::InvalidRenderStart, single);
+                pacer::telemetry::FailureReason::InvalidRenderStart, render_context);
         render_won.store(won, std::memory_order_release);
         if (won)
             concurrent_winners.fetch_add(1, std::memory_order_relaxed);
@@ -1901,18 +1992,18 @@ static void run_first_failure_telemetry_case()
             concurrent_winners.load(std::memory_order_relaxed));
 
     ledger.activateEpoch(49, 2);
-    ledger.openRenderCapture(49, 0, 1, 0);
+    ledger.openRenderCapture(49, 0, 1, 0, 99);
     check(ledger.shouldBypassPacing(),
             "first-failure: ledger-owned invalid START did not preserve bypass.\n");
 
     ledger.activateEpoch(51, 2);
-    ledger.openRenderCapture(51, 1, 1, 0);
+    ledger.openRenderCapture(51, 1, 1, 0, 101);
     check(ledger.shouldBypassPacing(),
             "first-failure: absent mapping invalid START did not preserve bypass.\n");
     /* The later duplicate must not replace the earlier MAPPING_ABSENT winner. */
     ledger.beginSimulation(51, 1, 1, pacer::SimulationLedger::time_point{});
-    ledger.openRenderCapture(51, 1, 1, 0);
-    ledger.openRenderCapture(51, 1, 1, 0);
+    ledger.openRenderCapture(51, 1, 1, 0, 102);
+    ledger.openRenderCapture(51, 1, 1, 0, 103);
 
     ledger.activateEpoch(53, 2);
     ledger.beginSimulation(53, 1, 1, pacer::SimulationLedger::time_point{});
@@ -1926,7 +2017,7 @@ static void run_first_failure_telemetry_case()
     ledger.activateEpoch(55, 2);
     ledger.beginSimulation(55, 1, 1, pacer::SimulationLedger::time_point{});
     ledger.openRenderCapture(55, 1, 1, 0);
-    ledger.openRenderCapture(55, 0, 1, 0);
+    ledger.openRenderCapture(55, 0, 1, 0, 601);
     check(ledger.shouldBypassPacing(),
             "first-failure: zero-ID rejection after open capture did not bypass pacing.\n");
 
@@ -1982,11 +2073,22 @@ static void run_first_failure_telemetry_case()
             concurrent_failure.find("\"failure_reason\":\"COMPLETION_FAILURE\"") !=
                     std::string::npos),
             "first-failure: concurrent telemetry reason was not owned by the CAS winner.\n");
+    check((render_won.load(std::memory_order_acquire) &&
+            concurrent_failure.find("\"originating_marker_serialization_sequence\":501") !=
+                    std::string::npos) ||
+            (completion_won.load(std::memory_order_acquire) &&
+            concurrent_failure.find("originating_marker_serialization_sequence") ==
+                    std::string::npos),
+            "first-failure: CAS loser changed the winning render marker identity.\n");
     std::string zero_external_id_failure = first_failure_for_epoch(first_failures, 49);
     std::string mapping_absent_failure = first_failure_for_epoch(first_failures, 51);
     std::string duplicate_failure = first_failure_for_epoch(first_failures, 53);
     std::string open_capture_zero_id_failure = first_failure_for_epoch(first_failures, 55);
     std::string preserved_winner_failure = first_failure_for_epoch(first_failures, 57);
+    std::string invalid_end_failure = first_failure_for_epoch(first_failures, 41);
+    check(invalid_end_failure.find("originating_marker_serialization_sequence") ==
+                    std::string::npos,
+            "first-failure: non-INVALID_RENDER_START acquired a render marker identity.\n");
     check(zero_external_id_failure.find("\"failure_reason\":\"INVALID_RENDER_START\"") !=
                     std::string::npos &&
             zero_external_id_failure.find("\"invalid_render_start_subreason\":\"ZERO_EXTERNAL_ID\"") !=
@@ -1995,8 +2097,12 @@ static void run_first_failure_telemetry_case()
     check(mapping_absent_failure.find("\"failure_reason\":\"INVALID_RENDER_START\"") !=
                     std::string::npos &&
             mapping_absent_failure.find("\"invalid_render_start_subreason\":\"MAPPING_ABSENT\"") !=
+                    std::string::npos &&
+            mapping_absent_failure.find("\"originating_marker_serialization_sequence\":101") !=
+                    std::string::npos &&
+            mapping_absent_failure.find("\"originating_marker_serialization_sequence\":102") ==
                     std::string::npos,
-            "first-failure: MAPPING_ABSENT did not retain the CAS-winning subreason.\n");
+            "first-failure: MAPPING_ABSENT did not retain the CAS-winning render identity.\n");
     check(duplicate_failure.find("\"failure_reason\":\"INVALID_RENDER_START\"") !=
                     std::string::npos &&
             duplicate_failure.find("\"invalid_render_start_subreason\":\"NON_MONOTONIC_OR_DUPLICATE\"") !=
@@ -2013,6 +2119,8 @@ static void run_first_failure_telemetry_case()
             open_capture_zero_id_failure.find("\"capture_generation\":0") !=
                     std::string::npos &&
             open_capture_zero_id_failure.find("\"context_id\":0") !=
+                    std::string::npos &&
+            open_capture_zero_id_failure.find("\"originating_marker_serialization_sequence\":601") !=
                     std::string::npos,
             "first-failure: zero-ID rejection inherited identity from the open capture.\n");
     check(preserved_winner_failure.find("\"failure_reason\":\"COMPLETION_FAILURE\"") !=
@@ -3042,6 +3150,7 @@ int main()
     run_telemetry_completion_identity_case();
     run_telemetry_completion_metadata_lifetime_case();
     run_invalid_render_start_subreason_unit_case();
+    run_marker_order_diagnostic_telemetry_case();
     run_first_failure_telemetry_case();
 
     if (failures)

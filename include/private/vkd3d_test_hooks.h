@@ -208,6 +208,9 @@ void pacer_test_sleep_for_frame(void *device, uint64_t frame_id);
 uint64_t pacer_test_get_sleep_entry_count(void *device);
 void pacer_test_pause_after_sleep(void *device, bool pause);
 bool pacer_test_sleep_returned(void *device);
+void pacer_test_arm_simulation_marker_after_arrival(void *device);
+void pacer_test_wait_simulation_marker_after_arrival(void *device);
+void pacer_test_resume_simulation_marker_after_arrival(void *device);
 void pacer_test_get_nvapi_adapter_state(void *device,
         struct vkd3d_test_nvapi_adapter_state *state);
 void pacer_test_set_prediction(void *device, uint64_t frame_id,

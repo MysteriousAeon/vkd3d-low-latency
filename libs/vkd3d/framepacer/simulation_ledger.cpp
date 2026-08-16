@@ -146,6 +146,8 @@ namespace pacer {
             event.timestamp2 = context.contextValue2;
             event.count0 = context.contextCount0;
             event.count1 = context.contextCount1;
+            event.originatingMarkerSerializationSequence =
+                    context.originatingMarkerSerializationSequence;
             event.flags = context.flags |
                     telemetry::FirstFailureReflexAccountingActive;
             telemetry::emit(event);
@@ -228,13 +230,16 @@ namespace pacer {
     }
 
     void SimulationLedger::openRenderCapture(uint64_t accountingEpoch,
-            uint64_t externalReflexId, uint32_t threadId, int32_t renderStart) {
+            uint64_t externalReflexId, uint32_t threadId, int32_t renderStart,
+            uint64_t originatingMarkerSerializationSequence) {
         std::lock_guard<dxvk::mutex> lock(m_mutex);
         if (!m_epochActive || accountingEpoch != m_activeEpoch)
             return;
         FirstFailureContext context;
         context.externalReflexId = externalReflexId;
         context.contextId = externalReflexId;
+        context.originatingMarkerSerializationSequence =
+                originatingMarkerSerializationSequence;
         if (!externalReflexId) {
             context.invalidRenderStartSubreason =
                     telemetry::InvalidRenderStartSubreason::ZeroExternalId;
