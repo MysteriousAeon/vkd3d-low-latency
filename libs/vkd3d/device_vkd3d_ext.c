@@ -21,6 +21,19 @@
 #include "vkd3d_private.h"
 #include "nvShaderExtnEnums.h"
 
+/* These paired references keep the selected chain and its queue alive while
+ * an out-of-lock native marker operation is in progress. */
+void dxgi_vk_swap_chain_acquire_latency_marker_reference(struct dxgi_vk_swap_chain *chain);
+void dxgi_vk_swap_chain_release_latency_marker_reference(struct dxgi_vk_swap_chain *chain);
+
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+void dxgi_vk_swap_chain_test_marker_lifetime_paired_refs_acquired_inside_selection_lock(
+        struct dxgi_vk_swap_chain *chain);
+void dxgi_vk_swap_chain_test_marker_lifetime_selection_lock_released(
+        struct dxgi_vk_swap_chain *chain);
+void dxgi_vk_swap_chain_test_marker_lifetime_after_acquire(struct dxgi_vk_swap_chain *chain);
+#endif
+
 uint32_t vkd3d_nv_shader_extn_entry_hash(const void *key)
 {
     return *(const unsigned int *)key;
@@ -1275,7 +1288,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_low_latency_device_SetLatencySleepMode(d3
 
 static HRESULT STDMETHODCALLTYPE d3d12_low_latency_device_SetLatencyMarker(d3d_low_latency_device_iface *iface, UINT64 frameID, UINT32 markerType)
 {
-    // struct dxgi_vk_swap_chain *low_latency_swapchain;
+    struct dxgi_vk_swap_chain *low_latency_swapchain;
     VkLatencyMarkerNV vk_marker;
     struct d3d12_device *device;
     uint64_t internal_frame_id;
@@ -1322,16 +1335,27 @@ static HRESULT STDMETHODCALLTYPE d3d12_low_latency_device_SetLatencyMarker(d3d_l
             break;
     }
 
-    // spinlock_acquire(&device->low_latency_swapchain_spinlock);
-    // if ((low_latency_swapchain = device->swapchain_info.low_latency_swapchain))
-    //     dxgi_vk_swap_chain_incref(low_latency_swapchain);
-    // spinlock_release(&device->low_latency_swapchain_spinlock);
-    //
-    // if (low_latency_swapchain)
-    // {
-    //     dxgi_vk_swap_chain_set_latency_marker(low_latency_swapchain, internal_frame_id, vk_marker, true);
-    //     dxgi_vk_swap_chain_decref(low_latency_swapchain);
-    // }
+    spinlock_acquire(&device->low_latency_swapchain_spinlock);
+    if ((low_latency_swapchain = device->swapchain_info.low_latency_swapchain))
+        dxgi_vk_swap_chain_acquire_latency_marker_reference(low_latency_swapchain);
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    if (low_latency_swapchain)
+        dxgi_vk_swap_chain_test_marker_lifetime_paired_refs_acquired_inside_selection_lock(
+                low_latency_swapchain);
+#endif
+    spinlock_release(&device->low_latency_swapchain_spinlock);
+
+    if (low_latency_swapchain)
+    {
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        dxgi_vk_swap_chain_test_marker_lifetime_selection_lock_released(low_latency_swapchain);
+        /* This is deliberately after the selected-chain lock is dropped: the
+         * test may concurrently run the real public swapchain Release. */
+        dxgi_vk_swap_chain_test_marker_lifetime_after_acquire(low_latency_swapchain);
+#endif
+        dxgi_vk_swap_chain_set_latency_marker(low_latency_swapchain, frameID, vk_marker, true);
+        dxgi_vk_swap_chain_release_latency_marker_reference(low_latency_swapchain);
+    }
 
     return S_OK;
 }

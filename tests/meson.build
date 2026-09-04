@@ -76,6 +76,24 @@ framepacer_accounting_test = executable('framepacer-accounting',
 
 test('framepacer-accounting', framepacer_accounting_test)
 
+marker_lifetime_cc = meson.get_compiler('c')
+if host_machine.cpu_family() == 'x86_64'
+  marker_lifetime_vulkan_dep = marker_lifetime_cc.find_library('vulkan-1',
+    dirs : ['/usr/lib/wine/x86_64-windows'], required : true)
+else
+  marker_lifetime_vulkan_dep = marker_lifetime_cc.find_library('vulkan-1',
+    dirs : ['/usr/lib/wine/i386-windows'], required : true)
+endif
+
+marker_lifetime_test = executable('marker-lifetime',
+  'marker_lifetime.c',
+  dependencies        : [ vkd3d_dep, vkd3d_common_dep, marker_lifetime_vulkan_dep ],
+  include_directories : [ vkd3d_private_includes, include_directories('..'), include_directories('../libs/vkd3d') ],
+  install             : false,
+  c_args              : vkd3d_test_flags)
+
+test('marker-lifetime', marker_lifetime_test)
+
 framepacer_telemetry_test = executable('framepacer-telemetry',
   'framepacer_telemetry.cpp',
   '../libs/vkd3d/framepacer/telemetry.cpp',
