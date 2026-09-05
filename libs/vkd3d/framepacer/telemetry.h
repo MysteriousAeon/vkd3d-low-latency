@@ -146,6 +146,36 @@ static_assert(std::is_trivially_copyable_v<Event>);
 
 uint64_t nowNs();
 
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+/* TerminalOutput is the existing post-loop write containing the remaining
+ * ordinary records plus SUMMARY, not a new production shutdown phase. */
+enum class TestWritePhase { Runtime, TerminalOutput, Flush };
+struct TestWriteObservation {
+    bool hit = false;
+    bool stopped = false;
+    TestWritePhase phase = TestWritePhase::Runtime;
+    size_t prefixBytes = 0;
+};
+#ifdef _WIN32
+enum class TestControlFailure { None, ThreadStart, CreatePipe, ConnectPipe };
+enum class TestControlPoint { BeforeCreate, Ready, Finished };
+struct TestControlObservation {
+    unsigned attempts = 0;
+    TestControlFailure failureHit = TestControlFailure::None;
+    bool started = false;
+    bool beforeCreate = false;
+    bool ready = false;
+    bool finished = false;
+};
+bool testConfigureControl(TestControlFailure failure, bool holdBeforeCreate);
+bool testWaitControl(TestControlPoint point);
+void testReleaseControl();
+TestControlObservation testControlObservation();
+/* Reset only after the detached listener has acknowledged its last test access. */
+bool testResetControl();
+#endif
+#endif
+
 class Session {
 public:
     Session(const std::string& path, uint32_t waitLatency,
@@ -175,6 +205,10 @@ public:
     void testStartWriter();
     bool testClosing() const;
     void testWaitWriterFailed();
+    void testFailWrite(TestWritePhase phase, uint64_t sequence, size_t prefixBytes);
+    std::string testFormatEvent(Event event);
+    bool testWaitWriterStopped();
+    TestWriteObservation testWriteObservation();
 #endif
 
 private:
@@ -231,6 +265,16 @@ private:
     std::atomic<bool> m_globalActive = {false};
 #ifdef VKD3D_ENABLE_TEST_HOOKS
     InitializationFailure m_testFailure = InitializationFailure::None;
+    std::mutex m_testWriteMutex;
+    std::condition_variable m_testWriteCond;
+    bool m_testWriteArmed = false;
+    TestWritePhase m_testFailurePhase = TestWritePhase::Runtime;
+    TestWritePhase m_testWritePhase = TestWritePhase::Runtime;
+    uint64_t m_testWriteSequence = 0;
+    size_t m_testPrefixBytes = 0;
+    TestWriteObservation m_testWriteObservation;
+    size_t testWriteOutput(const std::string& output);
+    int testFlushOutput();
 #endif
 };
 
@@ -304,6 +348,9 @@ void testArmFinalizationPause();
 void testWaitFinalizationPaused();
 void testResumeFinalization();
 void testWaitForFinalizationWaiter();
+void testFailGlobalWrite(TestWritePhase phase, uint64_t sequence, size_t prefixBytes);
+bool testWaitGlobalWriterStopped();
+TestWriteObservation testGlobalWriteObservation();
 #endif
 
 } // namespace pacer::telemetry

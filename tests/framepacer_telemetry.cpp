@@ -126,6 +126,7 @@ static void testPipeTransportRoundTrip() {
 
     setTelemetryControl(token);
     check(testInitialize(path, 3, 64), "enabled control initialization failed");
+    check(testWaitControl(TestControlPoint::Ready), "existing pipe transport did not become ready");
     std::string output = testOutputPath();
     std::string helper = controlHelperPath();
     std::string pid = std::to_string(unsigned(_getpid()));
@@ -136,6 +137,7 @@ static void testPipeTransportRoundTrip() {
     intptr_t late = helper.empty() ? 0 : _spawnl(_P_WAIT, helper.c_str(), helper.c_str(),
             token.c_str(), pid.c_str(), nullptr);
     check(late != 0, "late one-shot control request unexpectedly succeeded");
+    check(testWaitControl(TestControlPoint::Finished), "existing pipe listener did not finish");
     setTelemetryControl("");
     testReset();
 }
@@ -891,7 +893,6 @@ static void testDistinctOutputsDoNotTruncate() {
             "separate output-identity sessions did not preserve complete framing");
 }
 
-#ifndef _WIN32
 enum class JsonType { Null, Boolean, Number, String, Array, Object };
 
 struct JsonValue {
@@ -1137,6 +1138,7 @@ private:
     size_t m_position = 0;
 };
 
+#ifndef _WIN32
 static std::vector<std::string> outputPathsForBase(const std::string& path) {
     const size_t separator = path.find_last_of('/');
     const std::string directory = separator == std::string::npos ? "." : path.substr(0, separator);
@@ -1530,7 +1532,354 @@ static void testMultiProcessOutputIdentity(const char *self) {
 }
 #endif
 
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+static std::string reproPath(const char *name) {
+    static unsigned serial;
+    return tempPath("vkd3d-capture009-") + name + "-" +
+            std::to_string(nowNs()) + "-" + std::to_string(++serial) + ".jsonl";
+}
+
+static Event reproEvent() {
+    Event event;
+    event.type = Type::Submit;
+    event.phase = Phase::Complete;
+    event.deviceId = 1;
+    event.epochId = 1;
+    event.simulationId = 1;
+    event.queueRole = QueueRole::Normal;
+    event.captureClass = CaptureClass::RenderCaptured;
+    return event;
+}
+
+static void validateCompleteRepro(const std::string& path, unsigned events) {
+    auto bytes = readBytes(path);
+    auto lines = readLines(path);
+    check(!bytes.empty() && bytes.back() == '\n', "repro output lacks terminal newline");
+    check(lines.size() == events + 2 && countRun(lines) == 1 && countSummary(lines) == 1,
+            "repro RUN/ordinary/SUMMARY counts are wrong");
+    for (size_t i = 0; i < lines.size(); ++i) {
+        try {
+            JsonValue record = JsonParser(lines[i]).parse();
+            const JsonValue *type = record.member("record_type");
+            check(type && type->type == JsonType::String, "repro record type missing");
+            if (type && type->text == "SUMMARY") {
+                const JsonValue *published = record.member("published_records");
+                const JsonValue *dropped = record.member("dropped_records");
+                check(i + 1 == lines.size() && published &&
+                        published->text == std::to_string(events) && dropped && dropped->text == "0",
+                        "repro SUMMARY is not terminal or counts disagree");
+            }
+            if (i && i + 1 < lines.size())
+                check(sequenceOf(lines[i]) == i, "repro ordinary sequence mismatch");
+        } catch (...) {
+            check(false, "repro contains invalid JSON");
+        }
+    }
+}
+
+static void validatePartialRepro(const std::string& path, unsigned completeEvents,
+        const std::string& prefix) {
+    const auto first = readBytes(path);
+    auto lines = readLines(path);
+    check(!first.empty() && first.back() != '\n', "partial repro has a terminal newline");
+    check(lines.size() == completeEvents + 2 && countRun(lines) == 1 && countSummary(lines) == 0,
+            "partial repro record counts disagree");
+    check(!lines.empty() && lines.back() == prefix && prefix.find('}') == std::string::npos,
+            "physical final line differs from selected ordinary prefix");
+    for (size_t i = 0; i + 1 < lines.size(); ++i) {
+        try {
+            check(JsonParser(lines[i]).parse().type == JsonType::Object,
+                    "complete prefix record is not JSON");
+        } catch (...) {
+            check(false, "record before selected partial event is malformed");
+        }
+        if (i)
+            check(sequenceOf(lines[i]) == i, "partial repro complete event sequence mismatch");
+    }
+    /* Writer is joined and file closed before either read. External read-only
+     * validation additionally records size/SHA-256 A/B and analyzer rejection. */
+    check(first == readBytes(path), "joined writer artifact changed between observations");
+    std::printf("CAPTURE009 PARTIAL path=%s size=%zu final=%s\n",
+            path.c_str(), first.size(), prefix.c_str());
+}
+
+static void testPartialWrite(TestWritePhase phase) {
+    int before = failures.load();
+    const bool terminal = phase == TestWritePhase::TerminalOutput;
+    Session session(reproPath(terminal ? "terminal" : "ordinary"), 3, 128, true);
+    check(session.enabled(), "partial-write session initialization failed");
+    if (!session.enabled()) return;
+    const unsigned completeEvents = terminal ? 32 : 96;
+    Event event = reproEvent();
+    event.sequence = completeEvents + 1;
+    const auto formatted = session.testFormatEvent(event);
+    const auto cut = formatted.find(",\"cpu_timestamp_ns\":") + 1;
+    check(cut && cut < formatted.size(), "source-derived partial selector missing");
+    if (!cut || cut >= formatted.size()) return;
+    session.testFailWrite(phase, event.sequence, cut);
+    for (unsigned i = 0; i <= completeEvents; ++i)
+        check(session.publish(event), "partial-write event rejected before writer release");
+    if (!terminal) {
+        session.testStartWriter();
+        check(session.testWaitWriterStopped(), "ordinary partial writer did not stop");
+        check(!session.enabled() && !session.publish(event),
+                "ordinary short write did not close producer admission");
+    }
+    check(!session.shutdown(), "short-write shutdown fabricated success");
+    auto observation = session.testWriteObservation();
+    check(observation.hit && observation.stopped && observation.phase == phase &&
+            observation.prefixBytes == cut, "short write missed its intended source phase");
+    validatePartialRepro(session.outputPath(), completeEvents, formatted.substr(0, cut));
+    check(!session.shutdown(), "repeated failed shutdown changed its result");
+    std::printf("CAPTURE009 %s %s path=%s\n", terminal ? "FINAL-DRAIN" : "ORDINARY",
+            failures.load() == before ? "PASS" : "FAIL", session.outputPath().c_str());
+}
+
+static void testFlushFailure() {
+    int before = failures.load();
+    Session session(reproPath("flush"), 3, 64, true);
+    check(session.enabled(), "flush failure session initialization failed");
+    if (!session.enabled()) return;
+    session.testFailWrite(TestWritePhase::Flush, 0, 0);
+    for (unsigned i = 0; i < 8; ++i)
+        check(session.publish(reproEvent()), "flush scenario rejected an ordinary event");
+    check(!session.shutdown(), "fflush failure fabricated successful shutdown");
+    auto observation = session.testWriteObservation();
+    check(observation.hit && observation.stopped && observation.phase == TestWritePhase::Flush,
+            "fflush scenario did not hit the checked fflush branch");
+    /* The existing fclose can still persist the buffer after the injected
+     * fflush failure. File completeness and shutdown success are distinct. */
+    validateCompleteRepro(session.outputPath(), 8);
+    std::printf("CAPTURE009 FFLUSH %s path=%s\n",
+            failures.load() == before ? "PASS" : "FAIL", session.outputPath().c_str());
+}
+
+#ifdef _WIN32
+static void consumeControl(const std::string& token) {
+    HANDLE pipe = CreateFileA(controlEndpoint(token).c_str(), GENERIC_READ | GENERIC_WRITE,
+            0, nullptr, OPEN_EXISTING, 0, nullptr);
+    check(pipe != INVALID_HANDLE_VALUE, "could not open ready one-shot endpoint");
+    if (pipe == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    /* Existing invalid-request branch replies UNAVAILABLE and consumes the
+     * listener without invoking FINALIZE. No production protocol addition. */
+    const char request[] = "PROBE\n";
+    check(WriteFile(pipe, request, sizeof(request) - 1, &written, nullptr) &&
+            written == sizeof(request) - 1, "could not consume one-shot endpoint");
+    CloseHandle(pipe);
+}
+
+struct ControlCleanup {
+    std::string token;
+    ~ControlCleanup() {
+        testReleaseControl();
+        auto observation = testControlObservation();
+        if (observation.attempts && !observation.finished) {
+            if (testWaitControl(TestControlPoint::Ready) &&
+                    !testControlObservation().finished)
+                consumeControl(token);
+            check(testWaitControl(TestControlPoint::Finished), "listener cleanup timed out");
+        }
+        setTelemetryControl("");
+        setTelemetryPath("");
+        testReset();
+        check(testResetControl(), "listener state could not safely reset");
+    }
+};
+
+static void testControlScenario(unsigned scenario) {
+    int before = failures.load();
+    testReset();
+    std::string token = "capture009-test-" + std::to_string(nowNs());
+    ControlCleanup cleanup{token};
+    TestControlFailure failure = scenario == 3 ? TestControlFailure::ThreadStart :
+            scenario == 4 ? TestControlFailure::CreatePipe :
+            scenario == 5 ? TestControlFailure::ConnectPipe : TestControlFailure::None;
+    check(testConfigureControl(failure, scenario == 1), "control hook configuration failed");
+    setTelemetryControl(token);
+    setTelemetryPath(reproPath("control"));
+    initialize(3);
+    std::string output = testOutputPath();
+    check(testInitializationComplete() && testActive() && isEnabled(),
+            "initialize did not return with usable active telemetry");
+    if (scenario == 1) {
+        check(testWaitControl(TestControlPoint::BeforeCreate), "listener did not reach pre-create hold");
+        auto held = testControlObservation();
+        check(held.started && held.beforeCreate && !held.ready && !held.finished &&
+                !WaitNamedPipeA(controlEndpoint(token).c_str(), 1),
+                "CONTROL-1 endpoint observable while held before creation");
+        std::printf("CAPTURE009 CONTROL-1 %s\n", failures.load() == before ? "PASS" : "FAIL");
+        before = failures.load();
+        testReleaseControl();
+        check(testWaitControl(TestControlPoint::Ready), "released endpoint never became ready");
+        const auto helper = controlHelperPath();
+        const auto pid = std::to_string(unsigned(_getpid()));
+        intptr_t result = helper.empty() ? -1 : _spawnl(_P_WAIT, helper.c_str(),
+                helper.c_str(), token.c_str(), pid.c_str(), nullptr);
+        check(result == 0, "CONTROL-2 existing helper transport failed");
+        check(testWaitControl(TestControlPoint::Finished), "CONTROL-2 listener did not finish");
+        check(testFinalized(), "CONTROL-2 helper did not finalize");
+        validateCompleteRepro(output, 0);
+        std::printf("CAPTURE009 CONTROL-2 %s\n", failures.load() == before ? "PASS" : "FAIL");
+        return;
+    }
+    if (scenario == 6) {
+        check(testWaitControl(TestControlPoint::Ready), "consume scenario endpoint never ready");
+        consumeControl(token);
+    }
+    check(testWaitControl(TestControlPoint::Finished), "failed/consumed listener did not finish");
+    auto observation = testControlObservation();
+    check(observation.failureHit == failure && observation.started &&
+            observation.attempts == 1 && observation.finished &&
+            observation.beforeCreate == (scenario != 3) &&
+            observation.ready == (scenario == 5 || scenario == 6),
+            "control scenario hit the wrong listener startup branch");
+    check(!WaitNamedPipeA(controlEndpoint(token).c_str(), 1), "failed/consumed endpoint still available");
+    check(testActive() && isEnabled() && emit(reproEvent()),
+            "telemetry could not publish after listener failure/consumption");
+    initialize(3);
+    check(testControlObservation().attempts == 1 &&
+            !WaitNamedPipeA(controlEndpoint(token).c_str(), 1), "listener was recreated");
+    shutdown();
+    check(testFinalized(), "control scenario normal shutdown did not finalize");
+    validateCompleteRepro(output, 1);
+    std::printf("CAPTURE009 CONTROL-%u %s\n", scenario, failures.load() == before ? "PASS" : "FAIL");
+}
+
+static int exitProcessChild(const char *base) {
+    setTelemetryControl("");
+    setTelemetryPath(base);
+    initialize(3);
+    if (!isEnabled() || testFinalizationAuthority() != TestFinalizationAuthority::ProcessPreExit)
+        return 91;
+    for (unsigned i = 0; i < 12; ++i)
+        if (!emit(reproEvent())) return 92;
+    ExitProcess(23);
+}
+
+static void testExitProcessChild() {
+    int before = failures.load();
+    const std::string base = reproPath("exit23");
+    char module[MAX_PATH];
+    DWORD length = GetModuleFileNameA(nullptr, module, sizeof(module));
+    check(length && length < sizeof(module), "child executable path unavailable");
+    if (!length || length >= sizeof(module)) return;
+    std::string command = "\"" + std::string(module, length) + "\" --capture009-exit-child \"" + base + "\"";
+    STARTUPINFOA startup = {};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process = {};
+    bool created = CreateProcessA(module, command.data(), nullptr, nullptr, FALSE,
+            0, nullptr, nullptr, &startup, &process);
+    check(created, "ExitProcess child creation failed");
+    if (!created) return;
+    DWORD wait = WaitForSingleObject(process.hProcess, 15000);
+    check(wait == WAIT_OBJECT_0, "ExitProcess child timed out");
+    if (wait != WAIT_OBJECT_0) {
+        TerminateProcess(process.hProcess, 93);
+        WaitForSingleObject(process.hProcess, 5000);
+    }
+    DWORD code = 0;
+    check(GetExitCodeProcess(process.hProcess, &code) && code == 23,
+            "real ExitProcess child did not exit 23 (91 means pre-exit callback unavailable)");
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    const std::string pattern = base.substr(0, base.size() - 6) + ".pid-" +
+            std::to_string(process.dwProcessId) + ".run-*.jsonl";
+    WIN32_FIND_DATAA entry;
+    HANDLE search = FindFirstFileA(pattern.c_str(), &entry);
+    check(search != INVALID_HANDLE_VALUE, "exact child artifact missing");
+    if (search == INVALID_HANDLE_VALUE) return;
+    const auto separator = base.find_last_of("/\\");
+    const std::string output = base.substr(0, separator + 1) + entry.cFileName;
+    check(!FindNextFileA(search, &entry), "child artifact namespace is ambiguous");
+    FindClose(search);
+    validateCompleteRepro(output, 12);
+    auto lines = readLines(output);
+    if (!lines.empty()) {
+        try {
+            auto run = JsonParser(lines.front()).parse();
+            const auto *pid = run.member("process_id");
+            const auto *runId = run.member("run_id");
+            check(pid && pid->text == std::to_string(process.dwProcessId) && runId &&
+                    output.find(".run-" + runId->text + ".jsonl") != std::string::npos,
+                    "child RUN identity differs from its filename or process");
+        } catch (...) { check(false, "child RUN parsing failed"); }
+    }
+    std::printf("CAPTURE009 EXITPROCESS23 %s code=%lu path=%s\n",
+            failures.load() == before ? "PASS" : "FAIL", code, output.c_str());
+}
+
+static void testControlWriterComposition() {
+    int before = failures.load();
+    testReset();
+    const std::string token = "capture009-composition-" + std::to_string(nowNs());
+    ControlCleanup cleanup{token};
+    check(testConfigureControl(TestControlFailure::ThreadStart, false),
+            "composition control hook configuration failed");
+    setTelemetryControl(token);
+    setTelemetryPath(reproPath("composition"));
+    initialize(3);
+    const std::string output = testOutputPath();
+    check(testWaitControl(TestControlPoint::Finished) && testActive() && isEnabled() &&
+            testControlObservation().failureHit == TestControlFailure::ThreadStart &&
+            !WaitNamedPipeA(controlEndpoint(token).c_str(), 1),
+            "composition did not start active with nonempty-token endpoint unavailable");
+    Session formatter("", 3);
+    Event event = reproEvent();
+    event.sequence = 97;
+    const auto formatted = formatter.testFormatEvent(event);
+    const auto cut = formatted.find(",\"cpu_timestamp_ns\":") + 1;
+    check(cut && cut < formatted.size(), "composition prefix selector missing");
+    if (!cut || cut >= formatted.size()) return;
+    testFailGlobalWrite(TestWritePhase::Runtime, event.sequence, cut);
+    for (unsigned i = 0; i < 97; ++i)
+        check(emit(event), "composition rejected an event before the selected writer failure");
+    check(testWaitGlobalWriterStopped(), "composition writer did not stop");
+    auto observation = testGlobalWriteObservation();
+    check(observation.hit && observation.phase == TestWritePhase::Runtime && !isEnabled(),
+            "composition did not hit ordinary runtime short write");
+    check(testControlObservation().attempts == 1 &&
+            !WaitNamedPipeA(controlEndpoint(token).c_str(), 1), "composition recreated control endpoint");
+    check(testExplicitFinalize() == ExplicitFinalizeResult::FailedIncomplete && testFinalized(),
+            "composition finalization fabricated success");
+    validatePartialRepro(output, 96, formatted.substr(0, cut));
+    std::printf("CAPTURE009 COMPOSITION %s path=%s (coexistence only)\n",
+            failures.load() == before ? "PASS" : "FAIL", output.c_str());
+}
+#endif
+
+static void testCapture009(const std::string& mode) {
+#ifdef _WIN32
+    if (mode.empty() || mode == "--capture009-control")
+        for (unsigned scenario : {1u, 3u, 4u, 5u, 6u}) testControlScenario(scenario);
+#endif
+    if (mode.empty() || mode == "--capture009-writer") {
+        testPartialWrite(TestWritePhase::Runtime);
+        testPartialWrite(TestWritePhase::TerminalOutput);
+        testFlushFailure();
+    }
+#ifdef _WIN32
+    if (mode.empty() || mode == "--capture009-exit") testExitProcessChild();
+    if ((mode.empty() && !failures.load()) || mode == "--capture009-composition")
+        testControlWriterComposition();
+#endif
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+#ifdef _WIN32
+    if (argc == 3 && !std::strcmp(argv[1], "--capture009-exit-child"))
+        return exitProcessChild(argv[2]);
+#endif
+    if (argc == 2 && (!std::strcmp(argv[1], "--capture009-control") ||
+            !std::strcmp(argv[1], "--capture009-writer") ||
+            !std::strcmp(argv[1], "--capture009-exit") ||
+            !std::strcmp(argv[1], "--capture009-composition"))) {
+        testCapture009(argv[1]);
+        return failures.load() != 0;
+    }
+#endif
 #ifndef _WIN32
     if (argc == 6 && !std::strcmp(argv[1], "--telemetry-child"))
         return telemetryChild(argv[2], argv[3], std::atoi(argv[4]), std::atoi(argv[5]));
@@ -1566,6 +1915,9 @@ int main(int argc, char **argv) {
     testIncompleteExplicitFinalizationOutput();
 #else
     testPipeTransportRoundTrip();
+#endif
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    testCapture009("");
 #endif
     int failureCount = failures.load(std::memory_order_relaxed);
     if (failureCount)

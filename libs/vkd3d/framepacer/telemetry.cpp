@@ -98,6 +98,35 @@ static bool g_testFinalizationPaused;
 static bool g_testFinalizationResume;
 static uint32_t g_testFinalizationWaiters;
 
+#ifdef _WIN32
+static std::mutex g_testControlMutex;
+static std::condition_variable g_testControlCond;
+static TestControlFailure g_testControlFailure = TestControlFailure::None;
+static TestControlObservation g_testControlObservation;
+static bool g_testControlHold;
+
+static bool testControlFailure(TestControlFailure failure) {
+    std::lock_guard<std::mutex> lock(g_testControlMutex);
+    if (g_testControlFailure != failure)
+        return false;
+    g_testControlObservation.failureHit = failure;
+    return true;
+}
+
+static void testControlNotify(TestControlPoint point) {
+    std::unique_lock<std::mutex> lock(g_testControlMutex);
+    if (point == TestControlPoint::BeforeCreate)
+        g_testControlObservation.beforeCreate = true;
+    else if (point == TestControlPoint::Ready)
+        g_testControlObservation.ready = true;
+    else
+        g_testControlObservation.finished = true;
+    g_testControlCond.notify_all();
+    if (point == TestControlPoint::BeforeCreate)
+        g_testControlCond.wait(lock, [] { return !g_testControlHold; });
+}
+#endif
+
 static void testPauseProducer(ProducerPausePoint point) {
     std::unique_lock<std::mutex> lock(g_testPauseMutex);
     if (g_testPausePoint != point)
@@ -600,7 +629,12 @@ void Session::writeEvent(const Event& e, std::string& out) {
 void Session::writeOutput(const std::string& output) {
     if (output.empty())
         return;
-    if (!m_file || std::fwrite(output.data(), 1, output.size(), m_file.get()) != output.size() ||
+    if (!m_file ||
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+            testWriteOutput(output) != output.size() ||
+#else
+            std::fwrite(output.data(), 1, output.size(), m_file.get()) != output.size() ||
+#endif
             std::ferror(m_file.get()))
         throw std::runtime_error("telemetry output write failed");
 }
@@ -636,9 +670,18 @@ void Session::writerMain() {
         std::unique_lock<std::mutex> lock(m_waitMutex);
         m_waitCond.wait_for(lock, std::chrono::milliseconds(10));
     }
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    m_testWritePhase = TestWritePhase::TerminalOutput;
+#endif
     writeSummary(output);
     writeOutput(output);
-    if (std::fflush(m_file.get()) != 0)
+    if (
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+            testFlushOutput()
+#else
+            std::fflush(m_file.get())
+#endif
+            != 0)
         throw std::runtime_error("telemetry output flush failed");
 }
 
@@ -659,6 +702,13 @@ void Session::writerEntry() noexcept {
     } catch (...) {
         disableAfterWriterFailure();
     }
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    {
+        std::lock_guard<std::mutex> lock(m_testWriteMutex);
+        m_testWriteObservation.stopped = true;
+        m_testWriteCond.notify_all();
+    }
+#endif
 }
 
 bool Session::activateGlobal() noexcept {
@@ -719,6 +769,72 @@ bool Session::shutdown() {
 }
 
 #ifdef VKD3D_ENABLE_TEST_HOOKS
+void Session::testFailWrite(TestWritePhase phase, uint64_t sequence, size_t prefixBytes) {
+    std::lock_guard<std::mutex> lock(m_testWriteMutex);
+    m_testFailurePhase = phase;
+    m_testWriteSequence = sequence;
+    m_testPrefixBytes = prefixBytes;
+    m_testWriteArmed = true;
+    m_testWriteObservation = {};
+}
+
+std::string Session::testFormatEvent(Event event) {
+    std::string output;
+    writeEvent(event, output);
+    return output;
+}
+
+size_t Session::testWriteOutput(const std::string& output) {
+    std::lock_guard<std::mutex> lock(m_testWriteMutex);
+    if (m_testWriteArmed && m_testFailurePhase == m_testWritePhase) {
+        const std::string selector = "\"event_sequence\":" +
+                std::to_string(m_testWriteSequence) + ",";
+        size_t selected = output.find(selector);
+        if (selected != std::string::npos) {
+            size_t begin = output.rfind('\n', selected);
+            begin = begin == std::string::npos ? 0 : begin + 1;
+            size_t end = output.find('\n', selected);
+            if (!m_testPrefixBytes || end == std::string::npos ||
+                    m_testPrefixBytes >= end - begin)
+                throw std::runtime_error("invalid test short-write prefix");
+            size_t requested = begin + m_testPrefixBytes;
+            size_t written = std::fwrite(output.data(), 1, requested, m_file.get());
+            /* Materialize precisely this prefix before the existing short-write
+             * error handling runs. No test rewrites/truncates the artifact. */
+            if (std::fflush(m_file.get()) != 0 || written != requested)
+                throw std::runtime_error("test prefix could not reach the file");
+            m_testWriteArmed = false;
+            m_testWriteObservation.hit = true;
+            m_testWriteObservation.phase = m_testWritePhase;
+            m_testWriteObservation.prefixBytes = m_testPrefixBytes;
+            return written;
+        }
+    }
+    return std::fwrite(output.data(), 1, output.size(), m_file.get());
+}
+
+int Session::testFlushOutput() {
+    std::lock_guard<std::mutex> lock(m_testWriteMutex);
+    if (m_testWriteArmed && m_testFailurePhase == TestWritePhase::Flush) {
+        m_testWriteArmed = false;
+        m_testWriteObservation.hit = true;
+        m_testWriteObservation.phase = TestWritePhase::Flush;
+        return EOF;
+    }
+    return std::fflush(m_file.get());
+}
+
+bool Session::testWaitWriterStopped() {
+    std::unique_lock<std::mutex> lock(m_testWriteMutex);
+    return m_testWriteCond.wait_for(lock, std::chrono::seconds(5),
+            [this] { return m_testWriteObservation.stopped; });
+}
+
+TestWriteObservation Session::testWriteObservation() {
+    std::lock_guard<std::mutex> lock(m_testWriteMutex);
+    return m_testWriteObservation;
+}
+
 void Session::testStartWriter() {
     if (!enabled() || m_writerStarted)
         return;
@@ -976,11 +1092,30 @@ static const char *explicitFinalizeResultName(ExplicitFinalizeResult result) {
 }
 
 static void controlListener(std::string endpoint) noexcept {
-    HANDLE pipe = CreateNamedPipeA(endpoint.c_str(), PIPE_ACCESS_DUPLEX,
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    struct Done {
+        ~Done() { testControlNotify(TestControlPoint::Finished); }
+    } done;
+    testControlNotify(TestControlPoint::BeforeCreate);
+    HANDLE pipe = testControlFailure(TestControlFailure::CreatePipe) ? INVALID_HANDLE_VALUE :
+#else
+    HANDLE pipe =
+#endif
+            CreateNamedPipeA(endpoint.c_str(), PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 64, 64, 0, nullptr);
     if (pipe == INVALID_HANDLE_VALUE)
         return;
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    testControlNotify(TestControlPoint::Ready);
+    BOOL connected;
+    if (testControlFailure(TestControlFailure::ConnectPipe)) {
+        SetLastError(ERROR_PIPE_NOT_CONNECTED);
+        connected = FALSE;
+    } else
+        connected = ConnectNamedPipe(pipe, nullptr);
+#else
     BOOL connected = ConnectNamedPipe(pipe, nullptr);
+#endif
     if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
         CloseHandle(pipe);
         return;
@@ -1001,13 +1136,27 @@ static void controlListener(std::string endpoint) noexcept {
 static void startControlListener(const char *token) noexcept {
     if (!token || !*token || g_controlListenerStarted.exchange(true, std::memory_order_acq_rel))
         return;
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+    {
+        std::lock_guard<std::mutex> lock(g_testControlMutex);
+        ++g_testControlObservation.attempts;
+    }
+#endif
     /* The detached listener executes code in this module. Pin it until process
      * teardown rather than ever depending on DLL_PROCESS_DETACH for a join. */
     HMODULE module = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            reinterpret_cast<LPCWSTR>(controlListener), &module))
+            reinterpret_cast<LPCWSTR>(controlListener), &module)) {
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        testControlNotify(TestControlPoint::Finished);
+#endif
         return;
+    }
     try {
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        if (testControlFailure(TestControlFailure::ThreadStart))
+            throw std::runtime_error("injected control thread start failure");
+#endif
         std::string endpoint = "\\\\.\\pipe\\vkd3d-fg-latency-";
         endpoint += token;
         endpoint += "-";
@@ -1015,6 +1164,9 @@ static void startControlListener(const char *token) noexcept {
         std::thread(controlListener, std::move(endpoint)).detach();
     } catch (...) {
         FreeLibrary(module);
+#ifdef VKD3D_ENABLE_TEST_HOOKS
+        testControlNotify(TestControlPoint::Finished);
+#endif
         /* Telemetry remains usable when the optional experiment transport cannot start. */
     }
 }
@@ -1116,6 +1268,68 @@ void emitMarkerEvent(uint64_t deviceId, const MarkerObservation& observation,
 }
 
 #ifdef VKD3D_ENABLE_TEST_HOOKS
+#ifdef _WIN32
+bool testResetControl() {
+    std::lock_guard<std::mutex> lock(g_testControlMutex);
+    if (g_testControlObservation.attempts && !g_testControlObservation.finished)
+        return false;
+    g_testControlFailure = TestControlFailure::None;
+    g_testControlObservation = {};
+    g_testControlHold = false;
+    g_controlListenerStarted.store(false, std::memory_order_release);
+    return true;
+}
+
+bool testConfigureControl(TestControlFailure failure, bool holdBeforeCreate) {
+    if (!testResetControl())
+        return false;
+    std::lock_guard<std::mutex> lock(g_testControlMutex);
+    g_testControlFailure = failure;
+    g_testControlHold = holdBeforeCreate;
+    return true;
+}
+
+bool testWaitControl(TestControlPoint point) {
+    std::unique_lock<std::mutex> lock(g_testControlMutex);
+    return g_testControlCond.wait_for(lock, std::chrono::seconds(5), [point] {
+        return point == TestControlPoint::BeforeCreate ? g_testControlObservation.beforeCreate :
+                point == TestControlPoint::Ready ? g_testControlObservation.ready :
+                g_testControlObservation.finished;
+    });
+}
+
+void testReleaseControl() {
+    std::lock_guard<std::mutex> lock(g_testControlMutex);
+    g_testControlHold = false;
+    g_testControlCond.notify_all();
+}
+
+TestControlObservation testControlObservation() {
+    std::lock_guard<std::mutex> lock(g_testControlMutex);
+    auto result = g_testControlObservation;
+    result.started = g_controlListenerStarted.load(std::memory_order_acquire);
+    return result;
+}
+#endif
+
+void testFailGlobalWrite(TestWritePhase phase, uint64_t sequence, size_t prefixBytes) {
+    std::lock_guard<std::mutex> lock(g_sessionMutex);
+    if (g_sessionOwner)
+        g_sessionOwner->testFailWrite(phase, sequence, prefixBytes);
+}
+
+bool testWaitGlobalWriterStopped() {
+    /* Test caller excludes concurrent global finalization, as with the existing
+     * testWaitGlobalWriterFailed helper. */
+    Session *session = g_session.load(std::memory_order_acquire);
+    return session && session->testWaitWriterStopped();
+}
+
+TestWriteObservation testGlobalWriteObservation() {
+    std::lock_guard<std::mutex> lock(g_sessionMutex);
+    return g_sessionOwner ? g_sessionOwner->testWriteObservation() : TestWriteObservation{};
+}
+
 bool testInitialize(const std::string& path, uint32_t waitLatency,
         uint32_t capacity, bool deferWriter, InitializationFailure failure,
         TestFinalizationAuthority authority) {
