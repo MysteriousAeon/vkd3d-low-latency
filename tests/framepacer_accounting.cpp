@@ -1207,6 +1207,122 @@ static vkd3d_test_capture_snapshot capture_snapshot(fixture& f,
     return snapshot;
 }
 
+static void run_capture_arming_ledger_case()
+{
+    pacer::SimulationLedger ledger(2);
+    pacer::SubmitRecord submit = {};
+    pacer::SubmitCompletionResult completion = pacer::SubmitCompletionResult::NotCaptured;
+    pacer::SubmitTelemetryMetadata telemetry = {};
+    void *rollback_queue = nullptr;
+    uint64_t rollback_generation = 0;
+
+    ledger.activateEpoch(71, 2);
+    pacer::CaptureLeaseAcquisition fresh = ledger.acquireCaptureLease(71);
+    pacer::CaptureSnapshot empty = ledger.testCaptureSnapshot();
+    check(fresh.result == pacer::CaptureAcquireResult::NoOpenCapture && !fresh.token &&
+            !empty.captureRecordCount && !empty.openCaptureCount &&
+            !empty.activeLeaseCount && !ledger.shouldBypassPacing(),
+            "capture-arming: fresh active epoch acquisition was not benign.\n");
+
+    check(ledger.beginSimulation(71, 7101, 1,
+            pacer::SimulationLedger::time_point{}) == 2,
+            "capture-arming: failed to install pre-render simulation.\n");
+    pacer::CaptureLeaseAcquisition after_simulation = ledger.acquireCaptureLease(71);
+    empty = ledger.testCaptureSnapshot();
+    check(after_simulation.result == pacer::CaptureAcquireResult::NoOpenCapture &&
+            !after_simulation.token && !empty.captureRecordCount &&
+            !empty.openCaptureCount && !empty.activeLeaseCount &&
+            !ledger.shouldBypassPacing(),
+            "capture-arming: SIMULATION_START armed tracking.\n");
+
+    ledger.openRenderCapture(71, 7101, 1, 17);
+    pacer::CaptureLeaseAcquisition acquired = ledger.acquireCaptureLease(71);
+    check(acquired.result == pacer::CaptureAcquireResult::Acquired && acquired.token,
+            "capture-arming: first valid render START did not arm acquisition.\n");
+    check(ledger.commitCapturedSubmit(acquired.token, submit,
+            reinterpret_cast<void *>(1), 1),
+            "capture-arming: armed capture did not commit.\n");
+    check(ledger.publishVulkanSubmit(submit, reinterpret_cast<void *>(1), 1,
+            reinterpret_cast<void *>(2), 1, 0, 1, true, &rollback_queue,
+            &rollback_generation, &telemetry) == pacer::SubmitPublicationResult::Published,
+            "capture-arming: armed capture did not publish.\n");
+    ledger.accountCompletion(submit, reinterpret_cast<void *>(1), 1,
+            reinterpret_cast<void *>(2), 1, fixed_gpu_timestamp, 0, false,
+            &completion, &telemetry);
+    check(completion == pacer::SubmitCompletionResult::Accepted &&
+            !ledger.shouldBypassPacing(),
+            "capture-arming: armed capture did not complete normally.\n");
+
+    ledger.closeRenderCapture(71, 7101, 1, 18);
+    pacer::CaptureLeaseAcquisition armed_empty = ledger.acquireCaptureLease(71);
+    check(armed_empty.result == pacer::CaptureAcquireResult::NoOpenCapture &&
+            !armed_empty.token && ledger.shouldBypassPacing(),
+            "capture-arming: armed empty acquisition did not fail closed.\n");
+
+    ledger.activateEpoch(73, 2);
+    check(!ledger.shouldBypassPacing() &&
+            ledger.acquireCaptureLease(73).result == pacer::CaptureAcquireResult::NoOpenCapture,
+            "capture-arming: new epoch did not start unarmed.\n");
+    check(ledger.beginSimulation(73, 7301, 1,
+            pacer::SimulationLedger::time_point{}) == 2,
+            "capture-arming: failed to install rollover simulation.\n");
+    ledger.openRenderCapture(73, 7301, 1, 19);
+    pacer::CaptureLeaseAcquisition held = ledger.acquireCaptureLease(73);
+    check(held.result == pacer::CaptureAcquireResult::Acquired,
+            "capture-arming: rollover epoch did not arm normally.\n");
+    ledger.deactivateEpoch(73);
+    ledger.activateEpoch(75, 2);
+    check(!ledger.commitCapturedSubmit(held.token, submit,
+            reinterpret_cast<void *>(3), 2) && !ledger.shouldBypassPacing() &&
+            ledger.acquireCaptureLease(75).result == pacer::CaptureAcquireResult::NoOpenCapture,
+            "capture-arming: stale lease affected unarmed rollover epoch.\n");
+    check(ledger.beginSimulation(75, 7501, 1,
+            pacer::SimulationLedger::time_point{}) == 2,
+            "capture-arming: failed to install final epoch simulation.\n");
+    ledger.openRenderCapture(75, 7501, 1, 20);
+    check(ledger.acquireCaptureLease(75).result == pacer::CaptureAcquireResult::Acquired,
+            "capture-arming: final epoch did not arm normally.\n");
+
+    ledger.activateEpoch(77, 2);
+    ledger.openRenderCapture(77, 0, 1, 0);
+    check(ledger.shouldBypassPacing(),
+            "capture-arming: invalid START before arming was not fatal.\n");
+    ledger.activateEpoch(79, 2);
+    ledger.closeRenderCapture(79, 7901, 1, 0);
+    check(ledger.shouldBypassPacing(),
+            "capture-arming: invalid END before arming was not fatal.\n");
+    std::printf("capture-arming: pre-arm grace, arming, rollover, and fail-safe validated.\n");
+}
+
+static void run_capture_arming_execute_boundary_case()
+{
+    fixture f(false, false);
+    NvAPI_setSleepMode(f.device, true, 0);
+    NvAPI_sleep(f.device);
+    NvAPI_setLatencyMarker(f.device, 8101, VK_LATENCY_MARKER_SIMULATION_START_NV);
+
+    pacer_command_capture_lease early =
+            pacer_command_queue_acquire_capture(f.queues.command_queue);
+    vkd3d_test_framepacer_snapshot pre_armed = f.snapshot(0, 0);
+    check(!early.active && early.acquire_result == PACER_CAPTURE_NO_OPEN &&
+            pre_armed.cpu_finished == 1 && pre_armed.gpu_finished == 1 &&
+            !pre_armed.tracking_bypassed &&
+            capture_snapshot(f).active_lease_count == 0,
+            "capture-arming: pre-armed Execute acquisition was tracked or bypassed.\n");
+
+    NvAPI_setLatencyMarker(f.device, 8101, VK_LATENCY_MARKER_RENDERSUBMIT_START_NV);
+    check(pacer_command_queue_commit_capture(f.queues.command_queue, &early) == 0,
+            "capture-arming: pre-armed Execute acquired a delayed capture.\n");
+    pacer_command_capture_lease next =
+            pacer_command_queue_acquire_capture(f.queues.command_queue);
+    check(next.active && next.acquire_result == PACER_CAPTURE_ACQUIRED &&
+            capture_snapshot(f).active_lease_count == 1,
+            "capture-arming: next Execute was not captured after render START.\n");
+    pacer_command_queue_retire_capture(f.queues.command_queue, &next,
+            PACER_CAPTURE_RETIRE_BENIGN_ABORT);
+    std::printf("capture-arming: Execute boundary stayed ledger-linearized.\n");
+}
+
 static fixture::submit_pair commit_capture_lease(fixture& f,
         pacer_command_capture_lease *lease)
 {
@@ -3120,6 +3236,8 @@ int main()
     run_stale_waitable_task_case();
     run_device_construction_raii_case();
     run_waitable_teardown_case();
+    run_capture_arming_ledger_case();
+    run_capture_arming_execute_boundary_case();
     run_capture_start_a_execute_b_end_a_case();
     run_capture_close_then_publish_case();
     run_capture_execute_after_end_case();

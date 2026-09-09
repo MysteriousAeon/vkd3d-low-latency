@@ -384,6 +384,9 @@ namespace pacer {
         uint64_t m_highestStartedExternalId = 0;
         uint64_t m_telemetryDeviceId = 0;
         bool m_epochActive = false;
+        /* This epoch-local latch becomes visible together with the first
+         * completely installed valid render capture. */
+        bool m_captureTrackingArmed = false;
         std::atomic<bool> m_bypassPacing = { false };
     };
 

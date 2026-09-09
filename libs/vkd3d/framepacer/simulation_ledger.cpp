@@ -29,6 +29,7 @@ namespace pacer {
         m_activeEpoch = accountingEpoch;
         m_highestStartedExternalId = 0;
         m_epochActive = true;
+        m_captureTrackingArmed = false;
         m_bypassPacing.store(false, std::memory_order_release);
     }
 
@@ -54,6 +55,7 @@ namespace pacer {
         m_threadOwnership.clear();
         m_highestStartedExternalId = 0;
         m_epochActive = false;
+        m_captureTrackingArmed = false;
         m_bypassPacing.store(true, std::memory_order_release);
     }
 
@@ -283,6 +285,7 @@ namespace pacer {
         simulation->renderCaptureOpened = true;
         if (!simulation->renderStart)
             simulation->renderStart = renderStart;
+        m_captureTrackingArmed = true;
     }
 
     SimulationProgress SimulationLedger::closeRenderCapture(
@@ -351,6 +354,15 @@ namespace pacer {
             return result;
         }
         if (m_openCaptures.empty()) {
+            if (!m_captureTrackingArmed) {
+                result.result = CaptureAcquireResult::NoOpenCapture;
+                return result;
+            }
+            markUntrustedFrontierLocked(CaptureFailureReason::NoOpenCapture);
+            result.result = CaptureAcquireResult::NoOpenCapture;
+            return result;
+        }
+        if (!m_captureTrackingArmed) {
             markUntrustedFrontierLocked(CaptureFailureReason::NoOpenCapture);
             result.result = CaptureAcquireResult::NoOpenCapture;
             return result;
